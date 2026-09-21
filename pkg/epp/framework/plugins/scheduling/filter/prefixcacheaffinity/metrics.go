@@ -38,6 +38,14 @@ const (
 	// outcomeLoadOverride: the TTFT load gate discarded a non-empty sticky set
 	// because those endpoints were too slow, reopening all endpoints.
 	outcomeLoadOverride = "load_override"
+	// outcomeSessionCostStay: the session cost of the best sticky endpoint was no
+	// worse than the best non-sticky one, so the sticky set was kept.
+	outcomeSessionCostStay = "session_cost_stay"
+	// outcomeSessionCostMigrate: rebuilding cache on a non-sticky endpoint cost
+	// less over the session's remaining turns than queueing on the sticky set, so
+	// the non-sticky set was returned. Unlike load_override this discards the
+	// sticky endpoints, so the request does move.
+	outcomeSessionCostMigrate = "session_cost_migrate"
 	// outcomeExploration: the gate was skipped for exploration.
 	outcomeExploration = "exploration"
 	// outcomeNotApplicable: the filter had nothing to decide (a single

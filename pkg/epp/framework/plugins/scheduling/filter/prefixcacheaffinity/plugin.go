@@ -36,10 +36,12 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/sessionstate"
 	schedplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling"
 )
 
@@ -47,7 +49,10 @@ const (
 	PluginType = "prefix-cache-affinity-filter"
 )
 
-var _ fwksched.Filter = &Plugin{}
+var (
+	_ fwksched.Filter           = &Plugin{}
+	_ requestcontrol.PreRequest = &Plugin{}
+)
 
 // TTFTSource selects the per-endpoint TTFT signal used by the load gate. The
 // choice also determines which producer attribute the filter consumes.
@@ -61,6 +66,22 @@ const (
 	// PeakPrefillThroughput, reading InFlightLoad (produced by the
 	// in-flight-load-producer).
 	TTFTSourcePrefillThroughput TTFTSource = "prefillThroughput"
+)
+
+// PenaltySource selects how the filter decides whether load justifies giving up
+// cached context.
+type PenaltySource string
+
+const (
+	// PenaltySourceConstant compares the TTFT gap between the best sticky and
+	// best non-sticky endpoint against MaxTTFTPenaltyMs, keeping all endpoints
+	// when the gap is wider.
+	PenaltySourceConstant PenaltySource = "constant"
+	// PenaltySourceSessionCost scores every candidate on the prefill latency a
+	// session expects to pay over its remaining turns, and narrows to whichever
+	// of the two sets is cheaper. Reads UncachedRequestTokens (produced by the
+	// in-flight-load-producer) in addition to the TTFT source.
+	PenaltySourceSessionCost PenaltySource = "sessionCost"
 )
 
 type Config struct {
@@ -88,7 +109,16 @@ type Config struct {
 	// estimate TTFT from in-flight tokens when TTFTSource is prefillThroughput:
 	//   TTFT_ms = inFlightTokens / PeakPrefillThroughput * 1000
 	// (tokens / (tokens/sec) * 1000 = ms). Default: 15928.
+	//
+	// PenaltySourceSessionCost also converts a candidate's uncached tokens to
+	// milliseconds with it, on either TTFTSource, so that mode requires a
+	// non-zero value.
 	PeakPrefillThroughput float64 `json:"peakPrefillThroughput,omitempty"`
+
+	// PenaltySource selects how stickiness is weighed against load.
+	// PenaltySourceConstant (default) preserves the MaxTTFTPenaltyMs gate.
+	// Default: constant.
+	PenaltySource PenaltySource `json:"penaltySource,omitempty"`
 
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
@@ -100,6 +130,7 @@ var DefaultConfig = Config{
 	ExplorationProbability: 0,
 	MaxTTFTPenaltyMs:       18000,
 	TTFTSource:             TTFTSourcePrefillThroughput,
+	PenaltySource:          PenaltySourceConstant,
 
 	// Calibrated for Qwen 32B on 2x H100 80GB (TP=2), vLLM 0.19; see README.
 	PeakPrefillThroughput: 15928,
@@ -111,6 +142,12 @@ type Plugin struct {
 	prefixMatchDataKey           fwkplugin.DataKey
 	latencyPredictionInfoDataKey fwkplugin.DataKey
 	inFlightLoadDataKey          fwkplugin.DataKey
+	uncachedRequestTokensDataKey fwkplugin.DataKey
+
+	// survival is non-nil only under PenaltySourceSessionCost. Each configured
+	// instance keeps its own, so two instances counting the same request each
+	// record it once in their own table rather than twice in a shared one.
+	survival *turnSurvival
 }
 
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -127,14 +164,24 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		if err := registerMetrics(handle.Metrics()); err != nil {
 			return nil, err
 		}
+		if config.usesSessionCost() && config.MaxTTFTPenaltyMs > 0 {
+			log.FromContext(handle.Context()).Info(
+				"maxTTFTPenaltyMs is not used when penaltySource is sessionCost",
+				"plugin", name, "maxTTFTPenaltyMs", config.MaxTTFTPenaltyMs)
+		}
 	}
-	return &Plugin{
+	plugin := &Plugin{
 		typedName:                    fwkplugin.TypedName{Type: PluginType, Name: name},
 		config:                       config,
 		prefixMatchDataKey:           attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(config.PrefixMatchInfoProducerName),
 		latencyPredictionInfoDataKey: attrlatency.LatencyPredictionInfoDataKey.WithNonEmptyProducerName(config.LatencyPredictionInfoProducerName),
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
-	}, nil
+		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
+	}
+	if config.usesSessionCost() {
+		plugin.survival = newTurnSurvival()
+	}
+	return plugin, nil
 }
 
 func (c *Config) validate() error {
@@ -155,8 +202,19 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("ttftSource must be %q or %q, got %q", TTFTSourceLatencyPredictor, TTFTSourcePrefillThroughput, c.TTFTSource)
 	}
+	switch c.PenaltySource {
+	case PenaltySourceConstant, PenaltySourceSessionCost:
+	default:
+		return fmt.Errorf("penaltySource must be %q or %q, got %q", PenaltySourceConstant, PenaltySourceSessionCost, c.PenaltySource)
+	}
 	if !c.usesLatencyPredictor() && c.MaxTTFTPenaltyMs > 0 && c.PeakPrefillThroughput == 0 {
 		return errors.New("peakPrefillThroughput must be > 0 when ttftSource is prefillThroughput")
+	}
+	// sessionCost converts uncached tokens to milliseconds on either TTFT source,
+	// so the throughput figure is load-bearing even on the predictor path, where
+	// the constant gate permits zero.
+	if c.usesSessionCost() && c.PeakPrefillThroughput == 0 {
+		return errors.New("peakPrefillThroughput must be > 0 when penaltySource is sessionCost")
 	}
 	return nil
 }
@@ -166,6 +224,13 @@ func (c *Config) validate() error {
 // latencyPredictor selects the predictor.
 func (c *Config) usesLatencyPredictor() bool {
 	return c.TTFTSource == TTFTSourceLatencyPredictor
+}
+
+// usesSessionCost reports whether the filter narrows by expected session cost
+// rather than by the constant TTFT penalty. Constant is the default; only an
+// explicit sessionCost selects the cost function.
+func (c *Config) usesSessionCost() bool {
+	return c.PenaltySource == PenaltySourceSessionCost
 }
 
 func (p *Plugin) TypedName() fwkplugin.TypedName {
@@ -229,6 +294,29 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 		return endpoints
 	}
 
+	// Session cost gate: narrow to whichever set is cheaper over the session's
+	// remaining turns. Unlike the constant gate below this discards the losing
+	// set, so the comparison decides where the request goes rather than leaving
+	// it to the scorers.
+	if p.config.usesSessionCost() && len(nonSticky) > 0 {
+		remainingTurns := p.remainingTurns(request)
+		stickyCost := p.bestCost(sticky, remainingTurns)
+		nonStickyCost := p.bestCost(nonSticky, remainingTurns)
+		if v := logger.V(logutil.DEBUG); v.Enabled() {
+			v.Info("PrefixCacheAffinityFilter: session cost gate",
+				"stickyCost", stickyCost, "nonStickyCost", nonStickyCost,
+				"remainingTurns", remainingTurns)
+		}
+		if nonStickyCost < stickyCost {
+			recordDecision(p.typedName.Name, outcomeSessionCostMigrate)
+			span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeSessionCostMigrate))
+			return nonSticky
+		}
+		recordDecision(p.typedName.Name, outcomeSessionCostStay)
+		span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeSessionCostStay))
+		return sticky
+	}
+
 	// TTFT load gate: break stickiness if sticky endpoints are too slow.
 	if p.config.MaxTTFTPenaltyMs > 0 && len(nonSticky) > 0 {
 		bestStickyTTFT := p.bestTTFT(sticky)
@@ -256,12 +344,18 @@ func (p *Plugin) Consumes() fwkplugin.DataDependencies {
 	required := map[fwkplugin.DataKey]any{
 		p.prefixMatchDataKey: attrprefix.PrefixCacheMatchInfo{},
 	}
-	if p.config.MaxTTFTPenaltyMs > 0 {
+	// sessionCost reads the TTFT source on every call, so the dependency does not
+	// hinge on MaxTTFTPenaltyMs, which that mode ignores.
+	if p.config.MaxTTFTPenaltyMs > 0 || p.config.usesSessionCost() {
 		if p.config.usesLatencyPredictor() {
 			required[p.latencyPredictionInfoDataKey] = attrlatency.LatencyPredictionInfo{}
 		} else {
 			required[p.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
 		}
+	}
+	if p.config.usesSessionCost() {
+		required[p.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
+		required[sessionstate.SessionStateDataKey] = sessionstate.SessionState{}
 	}
 	return fwkplugin.DataDependencies{Required: required}
 }
@@ -304,6 +398,85 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) float64 {
 		return math.MaxFloat64
 	}
 	return float64(p.inFlightTokens(ep)) / p.config.PeakPrefillThroughput * 1000
+}
+
+// bestCost returns the lowest session cost (ms) across endpoints.
+func (p *Plugin) bestCost(endpoints []fwksched.Endpoint, remainingTurns float64) float64 {
+	best := math.MaxFloat64
+	for _, ep := range endpoints {
+		if cost := p.sessionCost(ep, remainingTurns); cost < best {
+			best = cost
+		}
+	}
+	return best
+}
+
+// sessionCost returns the prefill latency (ms) a session expects to pay on an
+// endpoint over its remaining turns: the prefill it owes here, paid once, plus
+// this endpoint's queueing delay on every remaining turn.
+func (p *Plugin) sessionCost(ep fwksched.Endpoint, remainingTurns float64) float64 {
+	penalty := p.migrationPenalty(ep)
+	return penalty + p.queueDelay(ep, penalty)*remainingTurns
+}
+
+// remainingTurns returns R for the request's session: how many turns it is
+// expected to still take, counting the one being scheduled. Falls back to
+// defaultRemainingTurns whenever the session is unknown or its turn index
+// carries too few observations to divide by.
+func (p *Plugin) remainingTurns(request *fwksched.InferenceRequest) float64 {
+	if p.survival == nil || request == nil {
+		return defaultRemainingTurns
+	}
+	state, ok := sessionstate.ReadSessionState(request)
+	if !ok {
+		return defaultRemainingTurns
+	}
+	if estimate, ok := p.survival.estimate(state.TurnsTaken); ok {
+		return estimate
+	}
+	return defaultRemainingTurns
+}
+
+// PreRequest records that the session reached its current turn. This is the only
+// hook that runs exactly once per dispatched request: Filter runs once per
+// scheduling profile, so a plugin referenced by both the prefill and decode
+// profiles would count a single request as several turns.
+func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) error {
+	if p.survival == nil || request == nil {
+		return nil
+	}
+	if state, ok := sessionstate.ReadSessionState(request); ok {
+		p.survival.observe(state.TurnsTaken)
+	}
+	return nil
+}
+
+// migrationPenalty returns the prefill cost (ms) of the tokens an endpoint has
+// not cached. Endpoints missing UncachedRequestTokens contribute no signal and
+// are never the cheapest, matching endpointTTFT's handling of an absent
+// prediction: treating an unknown as zero would make migration look free.
+func (p *Plugin) migrationPenalty(ep fwksched.Endpoint) float64 {
+	raw, ok := ep.Get(p.uncachedRequestTokensDataKey)
+	if !ok {
+		return math.MaxFloat64
+	}
+	uncached, ok := raw.(*attrconcurrency.UncachedRequestTokens)
+	if !ok || uncached == nil {
+		return math.MaxFloat64
+	}
+	return float64(uncached.Tokens) / p.config.PeakPrefillThroughput * 1000
+}
+
+// queueDelay returns an endpoint's wait (ms) excluding the prefill of the request
+// being scheduled, which is charged once as the migration penalty rather than on
+// every turn. The throughput estimate already excludes it; the latency
+// predictor's TTFT is derived from this request's length and the endpoint's
+// prefix cache score, so it contains the penalty and has it subtracted back out.
+func (p *Plugin) queueDelay(ep fwksched.Endpoint, penalty float64) float64 {
+	if !p.config.usesLatencyPredictor() {
+		return p.endpointTTFT(ep)
+	}
+	return math.Max(p.endpointTTFT(ep)-penalty, 0)
 }
 
 // inFlightTokens returns an endpoint's in-flight token count, or 0 when the
