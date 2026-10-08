@@ -82,18 +82,19 @@ func newTestFilter(t *testing.T, params parameters) (*PinUntilOverloadFilter, *f
 	return f, clk
 }
 
-func pods(waitingA, waitingB, waitingC int) []scheduling.Endpoint {
+// pods returns three endpoints out of name order; only pod-a has a queue.
+func pods(waitingA int) []scheduling.Endpoint {
 	return []scheduling.Endpoint{
-		newStubEndpoint("pod-b", waitingB),
+		newStubEndpoint("pod-b", 0),
 		newStubEndpoint("pod-a", waitingA),
-		newStubEndpoint("pod-c", waitingC),
+		newStubEndpoint("pod-c", 0),
 	}
 }
 
 func TestFilter_PinsToFirstEndpointByNameWhileArmed(t *testing.T) {
 	f, _ := newTestFilter(t, parameters{WaitingThreshold: 20, HoldSeconds: 30})
 
-	got := f.Filter(context.Background(), nil, pods(0, 0, 0))
+	got := f.Filter(context.Background(), nil, pods(0))
 
 	assert.Equal(t, []string{"pod-a"}, endpointNames(got))
 	assert.False(t, f.Released())
@@ -102,7 +103,7 @@ func TestFilter_PinsToFirstEndpointByNameWhileArmed(t *testing.T) {
 func TestFilter_PinsToConfiguredTarget(t *testing.T) {
 	f, _ := newTestFilter(t, parameters{TargetEndpoint: "pod-c", WaitingThreshold: 20, HoldSeconds: 30})
 
-	got := f.Filter(context.Background(), nil, pods(0, 0, 0))
+	got := f.Filter(context.Background(), nil, pods(0))
 
 	assert.Equal(t, []string{"pod-c"}, endpointNames(got))
 }
@@ -111,7 +112,7 @@ func TestFilter_KeepsTargetChosenOnFirstRequest(t *testing.T) {
 	f, _ := newTestFilter(t, parameters{WaitingThreshold: 20, HoldSeconds: 30})
 	f.Filter(context.Background(), nil, []scheduling.Endpoint{newStubEndpoint("pod-b", 0)})
 
-	got := f.Filter(context.Background(), nil, pods(0, 0, 0))
+	got := f.Filter(context.Background(), nil, pods(0))
 
 	assert.Equal(t, []string{"pod-b"}, endpointNames(got))
 }
@@ -120,36 +121,36 @@ func TestFilter_ReleasesAfterHoldAndStaysReleased(t *testing.T) {
 	f, clk := newTestFilter(t, parameters{WaitingThreshold: 20, HoldSeconds: 30})
 	ctx := context.Background()
 
-	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(20, 0, 0))))
+	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(20))))
 	clk.advance(29 * time.Second)
-	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(25, 0, 0))))
+	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(25))))
 	clk.advance(1 * time.Second)
-	assert.Equal(t, []string{"pod-b", "pod-a", "pod-c"}, endpointNames(f.Filter(ctx, nil, pods(25, 0, 0))))
+	assert.Equal(t, []string{"pod-b", "pod-a", "pod-c"}, endpointNames(f.Filter(ctx, nil, pods(25))))
 	assert.True(t, f.Released())
 
 	clk.advance(time.Minute)
-	assert.Equal(t, []string{"pod-b", "pod-a", "pod-c"}, endpointNames(f.Filter(ctx, nil, pods(0, 0, 0))))
+	assert.Equal(t, []string{"pod-b", "pod-a", "pod-c"}, endpointNames(f.Filter(ctx, nil, pods(0))))
 }
 
 func TestFilter_DipBelowThresholdResetsHold(t *testing.T) {
 	f, clk := newTestFilter(t, parameters{WaitingThreshold: 20, HoldSeconds: 30})
 	ctx := context.Background()
 
-	f.Filter(ctx, nil, pods(20, 0, 0))
+	f.Filter(ctx, nil, pods(20))
 	clk.advance(20 * time.Second)
-	f.Filter(ctx, nil, pods(19, 0, 0))
+	f.Filter(ctx, nil, pods(19))
 	clk.advance(20 * time.Second)
-	f.Filter(ctx, nil, pods(20, 0, 0))
+	f.Filter(ctx, nil, pods(20))
 	clk.advance(29 * time.Second)
 
-	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(20, 0, 0))))
+	assert.Equal(t, []string{"pod-a"}, endpointNames(f.Filter(ctx, nil, pods(20))))
 	assert.False(t, f.Released())
 }
 
 func TestFilter_ZeroHoldReleasesOnFirstOverload(t *testing.T) {
 	f, _ := newTestFilter(t, parameters{WaitingThreshold: 5})
 
-	got := f.Filter(context.Background(), nil, pods(5, 0, 0))
+	got := f.Filter(context.Background(), nil, pods(5))
 
 	assert.Len(t, got, 3)
 	assert.True(t, f.Released())
@@ -158,7 +159,7 @@ func TestFilter_ZeroHoldReleasesOnFirstOverload(t *testing.T) {
 func TestFilter_MissingTargetPassesThroughWithoutReleasing(t *testing.T) {
 	f, _ := newTestFilter(t, parameters{TargetEndpoint: "pod-x", WaitingThreshold: 20, HoldSeconds: 30})
 
-	got := f.Filter(context.Background(), nil, pods(0, 0, 0))
+	got := f.Filter(context.Background(), nil, pods(0))
 
 	assert.Len(t, got, 3)
 	assert.False(t, f.Released())
