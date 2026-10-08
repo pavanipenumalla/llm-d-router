@@ -142,6 +142,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	endpointattributefilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointattribute"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointhealth"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/pinuntiloverload"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity"
 	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sloheadroomtier"
@@ -703,6 +704,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(topologyaffinityfilter.FilterType, fwkplugin.StabilityAlpha, topologyaffinityfilter.Factory)
 	fwkplugin.Register(utilizationfilter.UtilizationFilterType, fwkplugin.StabilityAlpha, utilizationfilter.Factory)
 	fwkplugin.Register(endpointhealth.EndpointHealthFilterType, fwkplugin.StabilityAlpha, endpointhealth.Factory)
+	fwkplugin.Register(pinuntiloverload.PinUntilOverloadFilterType, fwkplugin.StabilityAlpha, pinuntiloverload.Factory)
 
 	// extra scheduling scorers
 	// Beta
