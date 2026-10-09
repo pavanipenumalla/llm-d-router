@@ -22,10 +22,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -111,6 +113,7 @@ func InFlightLoadProducerFactory(name string, decoder *json.Decoder, handle fwkp
 		typedName:                 fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: name},
 		requestTracker:            newConcurrencyTracker(),
 		tokenTracker:              newConcurrencyTracker(),
+		completionTracker:         newCompletionTracker(),
 		tokenEstimator:            NewSimpleTokenEstimator(cfg.MaxEstimatedOutputTokens),
 		addEstimatedOutputTokens:  cfg.AddEstimatedOutputTokens,
 		dk:                        attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(name),
@@ -137,6 +140,7 @@ type InFlightLoadProducer struct {
 	typedName                fwkplugin.TypedName
 	requestTracker           *concurrencyTracker
 	tokenTracker             *concurrencyTracker
+	completionTracker        *completionTracker
 	tokenEstimator           TokenEstimator
 	addEstimatedOutputTokens bool
 	PluginState              *fwkplugin.PluginState
@@ -321,8 +325,9 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 		Supply: func(endpointID string) func() datalayer.Cloneable {
 			return func() datalayer.Cloneable {
 				return &attrconcurrency.InFlightLoad{
-					Requests: p.requestTracker.get(endpointID),
-					Tokens:   p.tokenTracker.get(endpointID),
+					Requests:             p.requestTracker.get(endpointID),
+					Tokens:               p.tokenTracker.get(endpointID),
+					CompletionsPerSecond: p.completionTracker.rate(endpointID, time.Now()),
 				}
 			}
 		},
@@ -332,6 +337,7 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 				if ifl, ok := v.(*attrconcurrency.InFlightLoad); ok {
 					total.Requests += ifl.Requests
 					total.Tokens += ifl.Tokens
+					total.CompletionsPerSecond += ifl.CompletionsPerSecond
 				}
 			}
 			return total
@@ -373,8 +379,9 @@ func (p *InFlightLoadProducer) Extract(ctx context.Context, event datalayer.Endp
 		event.Endpoint.GetAttributes().Put(p.dk, &datalayer.DynamicAttribute{
 			Get: func() datalayer.Cloneable {
 				return &attrconcurrency.InFlightLoad{
-					Tokens:   p.GetTokens(id),
-					Requests: p.GetRequests(id),
+					Tokens:               p.GetTokens(id),
+					Requests:             p.GetRequests(id),
+					CompletionsPerSecond: p.completionTracker.rate(id, time.Now()),
 				}
 			},
 		})
@@ -583,6 +590,13 @@ func (p *InFlightLoadProducer) ResponseBody(
 		return
 	}
 
+	// The prefill endpoint finishes its part of the request at the first chunk.
+	if resp.StartOfStream {
+		if eid, ok := primaryEndpointID(result.ProfileResults[profilePrefill]); ok {
+			p.completionTracker.record(eid, time.Now())
+		}
+	}
+
 	// When output tokens are excluded, the in-flight token estimate represents only
 	// the prompt cost, which is consumed by prefill. As soon as the first chunk
 	// arrives (StartOfStream), prefill is done across all profiles, so free the
@@ -625,6 +639,7 @@ func (p *InFlightLoadProducer) ResponseBody(
 	// firing OnEvicted at most once per entry; entries already released at
 	// StartOfStream are gracefully no-op'd (LoadAndDelete miss / atomic Swap-to-0).
 	if resp.EndOfStream {
+		p.recordEndOfStreamCompletions(result)
 		if request.Body != nil && resp.Usage.CompletionTokens > 0 {
 			if bucket, ok := fwksched.ReadRequestAttribute[outlenbucket.Bucket](request, outlenbucket.AttributeKey); ok {
 				log.FromContext(ctx).V(logutil.VERBOSE).Info("outlen actual",
@@ -638,6 +653,37 @@ func (p *InFlightLoadProducer) ResponseBody(
 	} else {
 		p.PluginState.Touch(request.RequestID)
 	}
+}
+
+// recordEndOfStreamCompletions records one completion on each endpoint the
+// request was sent to, except the prefill endpoint, which finishes at the first
+// chunk. An endpoint chosen by several profiles is counted once.
+func (p *InFlightLoadProducer) recordEndOfStreamCompletions(result *fwksched.SchedulingResult) {
+	now := time.Now()
+	var recorded []string
+	for profileName, profileResult := range result.ProfileResults {
+		if profileName == profilePrefill {
+			continue
+		}
+		eid, ok := primaryEndpointID(profileResult)
+		if !ok || slices.Contains(recorded, eid) {
+			continue
+		}
+		recorded = append(recorded, eid)
+		p.completionTracker.record(eid, now)
+	}
+}
+
+// primaryEndpointID returns the ID of the endpoint a profile's request was sent to.
+func primaryEndpointID(profileResult *fwksched.ProfileRunResult) (string, bool) {
+	if profileResult == nil || len(profileResult.TargetEndpoints) == 0 {
+		return "", false
+	}
+	endpoint := profileResult.TargetEndpoints[0]
+	if endpoint == nil || endpoint.GetMetadata() == nil {
+		return "", false
+	}
+	return endpoint.GetMetadata().ID.String(), true
 }
 
 // release surgically deletes a single profile's entry from PluginState,
@@ -769,6 +815,7 @@ func (p *InFlightLoadProducer) Consumes() fwkplugin.DataDependencies {
 func (p *InFlightLoadProducer) DeleteEndpoint(endpointID string) {
 	p.requestTracker.delete(endpointID)
 	p.tokenTracker.delete(endpointID)
+	p.completionTracker.delete(endpointID)
 }
 
 func (p *InFlightLoadProducer) GetTokens(eid string) int64 {
