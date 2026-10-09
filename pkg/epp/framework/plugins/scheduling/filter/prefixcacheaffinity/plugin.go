@@ -76,6 +76,10 @@ const (
 	TTFTEstimateFull TTFTEstimate = "full"
 )
 
+// minCompletionsPerSecond is one completion in the inflight-load-producer's
+// 30 s window, the rate assumed for a slot-bound endpoint that finished nothing.
+const minCompletionsPerSecond = 1.0 / 30
+
 type Config struct {
 	// AffinityThreshold is the prefix cache score threshold. Endpoints with
 	// score >= this value are considered "sticky" (prompt is cached). Default: 0.80.
@@ -107,6 +111,11 @@ type Config struct {
 	// TTFTEstimateBackLog (default) only accounts inFlightTokens and TTFTEstimateFull also handles
 	// the request's uncached tokens.
 	TTFTEstimate TTFTEstimate `json:"ttftEstimate,omitempty"`
+
+	// MaxNumSeqs is the model server's limit on running requests (vLLM
+	// max_num_seqs). With TTFTEstimateFull, a value > 0 adds the wait for a
+	// running slot to the estimate when the endpoint is slot-bound; 0 leaves it out.
+	MaxNumSeqs int `json:"maxNumSeqs,omitempty"`
 
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
@@ -180,6 +189,9 @@ func (c *Config) validate() error {
 	case TTFTEstimateBackLog, TTFTEstimateFull:
 	default:
 		return fmt.Errorf("ttftEstimate must be %q or %q, got %q", TTFTEstimateBackLog, TTFTEstimateFull, c.TTFTEstimate)
+	}
+	if c.MaxNumSeqs < 0 {
+		return fmt.Errorf("maxNumSeqs must be >= 0, got %d", c.MaxNumSeqs)
 	}
 	if !c.usesLatencyPredictor() && c.MaxTTFTPenaltyMs > 0 && c.PeakPrefillThroughput == 0 {
 		return errors.New("peakPrefillThroughput must be > 0 when ttftSource is prefillThroughput")
@@ -344,10 +356,11 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
 		}
 		return math.MaxFloat64, false
 	}
-	tokens, ok := p.inFlightTokens(ep)
+	load, ok := p.inFlightLoad(ep)
 	if !ok {
 		return 0, false
 	}
+	tokens := load.Tokens
 	if p.config.usesFullEstimate() {
 		uncachedTokens, ok := p.uncachedRequestTokens(ep)
 		if !ok {
@@ -355,18 +368,37 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
 		}
 		tokens += uncachedTokens
 	}
-	return float64(tokens) / p.config.PeakPrefillThroughput * 1000, true
+	ttft := float64(tokens) / p.config.PeakPrefillThroughput * 1000
+	if p.config.usesFullEstimate() {
+		ttft += p.queueWaitMs(ep, load)
+	}
+	return ttft, true
 }
 
-// inFlightTokens returns an endpoint's in-flight token count. If the attribute is
-// absent, it returns ok=false so the caller can treat the signal as missing.
-func (p *Plugin) inFlightTokens(ep fwksched.Endpoint) (int64, bool) {
+// queueWaitMs estimates how long a new request waits for a running slot:
+// waiting requests / completions per second. It is 0 unless the endpoint is
+// slot-bound (running within one of MaxNumSeqs), because requests waiting for
+// prefill token budget are already counted in inFlightTokens. A completion rate
+// of 0 is raised to one completion per producer window.
+func (p *Plugin) queueWaitMs(ep fwksched.Endpoint, load *attrconcurrency.InFlightLoad) float64 {
+	metrics := ep.GetMetrics()
+	if p.config.MaxNumSeqs <= 0 || metrics == nil || metrics.WaitingQueueSize <= 0 ||
+		metrics.RunningRequestsSize < p.config.MaxNumSeqs-1 {
+		return 0
+	}
+	rate := max(load.CompletionsPerSecond, minCompletionsPerSecond)
+	return float64(metrics.WaitingQueueSize) / rate * 1000
+}
+
+// inFlightLoad returns an endpoint's in-flight load. If the attribute is absent,
+// it returns ok=false so the caller can treat the signal as missing.
+func (p *Plugin) inFlightLoad(ep fwksched.Endpoint) (*attrconcurrency.InFlightLoad, bool) {
 	if raw, ok := ep.Get(p.inFlightLoadDataKey); ok {
 		if load, ok := raw.(*attrconcurrency.InFlightLoad); ok && load != nil {
-			return load.Tokens, true
+			return load, true
 		}
 	}
-	return 0, false
+	return nil, false
 }
 
 // uncachedRequestTokens returns the number of tokens from the current request

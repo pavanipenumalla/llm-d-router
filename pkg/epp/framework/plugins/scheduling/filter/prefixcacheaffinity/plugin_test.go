@@ -137,6 +137,64 @@ func TestFilter_ThroughputTTFTWithinThreshold(t *testing.T) {
 	assert.Equal(t, "a", result[0].GetMetadata().ID.Name)
 }
 
+// makeQueuedEndpoint creates a test endpoint whose model server reports running
+// and waiting requests and whose in-flight load carries completionsPerSecond.
+func makeQueuedEndpoint(name string, prefixMatch int, tokens int64, running, waiting int, completionsPerSecond float64) fwksched.Endpoint {
+	meta := &fwkdl.EndpointMetadata{
+		ID: types.NamespacedName{Name: name, Namespace: "default"},
+	}
+	ep := fwksched.NewEndpoint(meta, &fwkdl.Metrics{RunningRequestsSize: running, WaitingQueueSize: waiting}, fwkdl.NewAttributes())
+	ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, 100, 16))
+	ep.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Tokens: tokens, CompletionsPerSecond: completionsPerSecond})
+	ep.Put(attrconcurrency.UncachedRequestTokensDataKey, &attrconcurrency.UncachedRequestTokens{Tokens: 0})
+	return ep
+}
+
+// With PeakPrefillThroughput=1000 tokens/sec, 1000 in-flight tokens map to 1000ms;
+// a slot-bound endpoint adds waiting / completionsPerSecond seconds.
+func TestEndpointTTFT_QueueWait(t *testing.T) {
+	full := Config{TTFTSource: TTFTSourcePrefillThroughput, PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 64}
+	backlog := full
+	backlog.TTFTEstimate = TTFTEstimateBackLog
+	noLimit := full
+	noLimit.MaxNumSeqs = 0
+	for _, tc := range []struct {
+		name                 string
+		config               Config
+		running, waiting     int
+		completionsPerSecond float64
+		want                 float64
+	}{
+		{name: "slots full", config: full, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000 + 61/1.6*1000},
+		{name: "one slot free", config: full, running: 63, waiting: 61, completionsPerSecond: 1.6, want: 1000 + 61/1.6*1000},
+		{name: "waiting for prefill budget", config: full, running: 10, waiting: 3, completionsPerSecond: 1.6, want: 1000},
+		{name: "slots full without completions", config: full, running: 64, waiting: 2, completionsPerSecond: 0, want: 1000 + 2*30*1000},
+		{name: "slots full without queue", config: full, running: 64, waiting: 0, completionsPerSecond: 1.6, want: 1000},
+		{name: "backlog ignores queue", config: backlog, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000},
+		{name: "no running limit configured", config: noLimit, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPlugin(tc.config)
+			ttft, ok := p.endpointTTFT(makeQueuedEndpoint("a", 90, 1000, tc.running, tc.waiting, tc.completionsPerSecond))
+			assert.True(t, ok)
+			assert.InDelta(t, tc.want, ttft, 1e-6)
+		})
+	}
+}
+
+// A sticky endpoint with little prefill work but a long slot queue breaks
+// stickiness through the queue wait alone.
+func TestFilter_QueueWaitBreaksStickiness(t *testing.T) {
+	p := newTestPlugin(Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 64})
+	endpoints := []fwksched.Endpoint{
+		makeQueuedEndpoint("a", 90, 100, 64, 61, 1.6),
+		makeQueuedEndpoint("b", 10, 0, 0, 0, 0),
+	}
+	result := p.Filter(context.Background(), nil, endpoints)
+	assert.Equal(t, 2, len(result), "queue wait should break stickiness")
+}
+
 func TestFilter_TTFTPenaltyDisabled(t *testing.T) {
 	p := newTestPlugin(Config{AffinityThreshold: 0.80, ExplorationProbability: 0, MaxTTFTPenaltyMs: 0, TTFTSource: TTFTSourcePrefillThroughput, PeakPrefillThroughput: 1000})
 	endpoints := []fwksched.Endpoint{
@@ -392,6 +450,12 @@ func TestFactory_InvalidTTFTEstimate(t *testing.T) {
 	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"ttftEstimate": "bogus"}`)), nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "ttftEstimate must be")
+}
+
+func TestFactory_NegativeMaxNumSeqs(t *testing.T) {
+	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"maxNumSeqs": -1}`)), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "maxNumSeqs must be")
 }
 
 // An empty ttftSource is rejected rather than silently defaulted: the default is

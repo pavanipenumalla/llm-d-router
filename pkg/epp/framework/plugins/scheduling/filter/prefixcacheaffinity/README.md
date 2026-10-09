@@ -63,8 +63,14 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
   `inFlightTokens / peakPrefillThroughput * 1000` (ms) when `ttftSource` is
   `prefillThroughput` (default); when `ttftEstimate` is `backlog` the numerator
   is `inFlightTokens`, and when `ttftEstimate` is `full` it becomes
-  `inFlightTokens + uncachedRequestTokens`. The TTFT comes
-  from the latency predictor when `ttftSource` is `latencyPredictor`
+  `inFlightTokens + uncachedRequestTokens`. With `full` and `maxNumSeqs > 0`, the
+  estimate also adds `waitingQueueSize / completionsPerSecond * 1000`, the time a new
+  request waits for a running slot, when the endpoint's running requests are at least
+  `maxNumSeqs - 1`. Below that, waiting requests wait for prefill token budget, which
+  `inFlightTokens` already counts. A completion rate of 0 is taken as one completion
+  in the producer's 30 s window. `waitingQueueSize` counts all traffic to the model
+  server, while `completionsPerSecond` counts only requests routed by the EPP. The TTFT
+  comes from the latency predictor when `ttftSource` is `latencyPredictor`
 - If either the sticky or non-sticky set has no endpoint with the TTFT source attribute
   (`LatencyPredictionInfo` or `InFlightLoad`), the TTFT load gate is skipped and all
   endpoints are kept; the `missing_signal` outcome is recorded. If no endpoints have
@@ -121,6 +127,7 @@ documents the strategy and its calibration.
 | `ttftSource` | `string` | No | `prefillThroughput` | TTFT source for the load gate: `prefillThroughput` or `latencyPredictor` |
 | `peakPrefillThroughput` | `float64` | No | `15928` | Peak prefill throughput (tokens/sec), used to estimate TTFT when `ttftSource` is `prefillThroughput` |
 | `ttftEstimate` | `string` | No | `backlog` | TTFT estimation method with `prefillThroughput` source: `backlog` or `full` |
+| `maxNumSeqs` | `int` | No | `0` | Model server's running-request limit (vLLM `max_num_seqs`); with `ttftEstimate: full`, a value > 0 adds the slot queue wait to the estimate |
 
 The `peakPrefillThroughput` default of `15928` tokens/sec is calibrated for Qwen 32B on
 2x H100 80GB (TP=2) with vLLM 0.19, measured as the prefill throughput of a single
@@ -131,7 +138,7 @@ to `latencyPredictor` to source TTFT from the latency predictor instead.
 ## Dependencies
 
 - Reads `PrefixCacheMatchInfo` from endpoint attributes (from `prefix-cache-scorer`)
-- Reads `InFlightLoad` for the TTFT load gate when `ttftSource` is `prefillThroughput` (from `in-flight-load-producer`)
+- Reads `InFlightLoad` (tokens and completion rate) and the endpoint's `WaitingQueueSize` metric for the TTFT load gate when `ttftSource` is `prefillThroughput` (from `in-flight-load-producer` and the metrics extractor)
 - Reads `LatencyPredictionInfo` for the TTFT load gate when `ttftSource` is `latencyPredictor` (from `predicted-latency-producer`)
 
 **Configuration Example:**
