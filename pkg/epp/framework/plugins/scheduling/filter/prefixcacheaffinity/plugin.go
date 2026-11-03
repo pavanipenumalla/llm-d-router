@@ -117,6 +117,16 @@ type Config struct {
 	// running slot to the estimate when the endpoint is slot-bound; 0 leaves it out.
 	MaxNumSeqs int `json:"maxNumSeqs,omitempty"`
 
+	// QueueWaitKVCacheThreshold is the KV cache usage, in (0, 1], at or above which
+	// an endpoint with waiting requests is KV-bound. With TTFTEstimateFull, a value
+	// > 0 adds the queue wait to a KV-bound endpoint's estimate; 0 leaves it out.
+	QueueWaitKVCacheThreshold float64 `json:"queueWaitKVCacheThreshold,omitempty"`
+
+	// FreeEndpointMaxWaiting is the largest waiting queue at which an endpoint
+	// counts as free. The queue wait is added only while at least one candidate
+	// endpoint is free. Default: 2.
+	FreeEndpointMaxWaiting int `json:"freeEndpointMaxWaiting,omitempty"`
+
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
 	InFlightLoadProducerName          string `json:"inFlightLoadProducerName,omitempty"`
@@ -129,8 +139,9 @@ var DefaultConfig = Config{
 	TTFTSource:             TTFTSourcePrefillThroughput,
 
 	// Calibrated for Qwen 32B on 2x H100 80GB (TP=2), vLLM 0.19; see README.
-	PeakPrefillThroughput: 15928,
-	TTFTEstimate:          TTFTEstimateBackLog,
+	PeakPrefillThroughput:  15928,
+	TTFTEstimate:           TTFTEstimateBackLog,
+	FreeEndpointMaxWaiting: 2,
 }
 
 type Plugin struct {
@@ -192,6 +203,12 @@ func (c *Config) validate() error {
 	}
 	if c.MaxNumSeqs < 0 {
 		return fmt.Errorf("maxNumSeqs must be >= 0, got %d", c.MaxNumSeqs)
+	}
+	if c.QueueWaitKVCacheThreshold < 0 || c.QueueWaitKVCacheThreshold > 1.0 {
+		return fmt.Errorf("queueWaitKVCacheThreshold must be in [0, 1], got %f", c.QueueWaitKVCacheThreshold)
+	}
+	if c.FreeEndpointMaxWaiting < 0 {
+		return fmt.Errorf("freeEndpointMaxWaiting must be >= 0, got %d", c.FreeEndpointMaxWaiting)
 	}
 	if !c.usesLatencyPredictor() && c.MaxTTFTPenaltyMs > 0 && c.PeakPrefillThroughput == 0 {
 		return errors.New("peakPrefillThroughput must be > 0 when ttftSource is prefillThroughput")
@@ -273,8 +290,9 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 
 	// TTFT load gate: break stickiness if sticky endpoints are too slow.
 	if p.config.MaxTTFTPenaltyMs > 0 && len(nonSticky) > 0 {
-		bestStickyTTFT, stickyOk := p.bestTTFT(sticky)
-		bestNonStickyTTFT, nonStickyOk := p.bestTTFT(nonSticky)
+		withQueueWait := hasFreeEndpoint(endpoints, p.config.FreeEndpointMaxWaiting)
+		bestStickyTTFT, stickyOk := p.bestTTFT(sticky, withQueueWait)
+		bestNonStickyTTFT, nonStickyOk := p.bestTTFT(nonSticky, withQueueWait)
 		if !stickyOk || !nonStickyOk {
 			logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: TTFT load gate skipped, missing signal",
 				"stickyObserved", stickyOk, "nonStickyObserved", nonStickyOk)
@@ -332,11 +350,11 @@ func (p *Plugin) prefixCacheScore(ep fwksched.Endpoint) float64 {
 }
 
 // bestTTFT returns the lowest per-endpoint TTFT (ms) across endpoints.
-func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint) (float64, bool) {
+func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint, withQueueWait bool) (float64, bool) {
 	best := math.MaxFloat64
 	found := false
 	for _, ep := range endpoints {
-		if ttft, ok := p.endpointTTFT(ep); ok && ttft < best {
+		if ttft, ok := p.endpointTTFT(ep, withQueueWait); ok && ttft < best {
 			best = ttft
 			found = true
 		}
@@ -348,7 +366,8 @@ func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint) (float64, bool) {
 // latency predictor or estimated from in-flight tokens and peak prefill
 // throughput. Endpoints missing the required attribute contribute no signal:
 // the function returns false and the endpoint is excluded from the bestTTFT calculation.
-func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
+// withQueueWait allows the queue wait term of the full estimate.
+func (p *Plugin) endpointTTFT(ep fwksched.Endpoint, withQueueWait bool) (float64, bool) {
 	if p.config.usesLatencyPredictor() {
 		if raw, ok := ep.Get(p.latencyPredictionInfoDataKey); ok {
 			info := raw.(*attrlatency.LatencyPredictionInfo)
@@ -369,25 +388,43 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
 		tokens += uncachedTokens
 	}
 	ttft := float64(tokens) / p.config.PeakPrefillThroughput * 1000
-	if p.config.usesFullEstimate() {
+	if p.config.usesFullEstimate() && withQueueWait {
 		ttft += p.queueWaitMs(ep, load)
 	}
 	return ttft, true
 }
 
-// queueWaitMs estimates how long a new request waits for a running slot:
+// queueWaitMs estimates how long a new request waits to be admitted:
 // waiting requests / completions per second. It is 0 unless the endpoint is
-// slot-bound (running within one of MaxNumSeqs), because requests waiting for
-// prefill token budget are already counted in inFlightTokens. A completion rate
+// slot-bound (running within one of MaxNumSeqs) or KV-bound (KV cache usage at
+// or above QueueWaitKVCacheThreshold), because otherwise requests wait for
+// prefill token budget, which inFlightTokens already counts. A completion rate
 // of 0 is raised to one completion per producer window.
 func (p *Plugin) queueWaitMs(ep fwksched.Endpoint, load *attrconcurrency.InFlightLoad) float64 {
 	metrics := ep.GetMetrics()
-	if p.config.MaxNumSeqs <= 0 || metrics == nil || metrics.WaitingQueueSize <= 0 ||
-		metrics.RunningRequestsSize < p.config.MaxNumSeqs-1 {
+	if metrics == nil || metrics.WaitingQueueSize <= 0 {
+		return 0
+	}
+	slotBound := p.config.MaxNumSeqs > 0 && metrics.RunningRequestsSize >= p.config.MaxNumSeqs-1
+	kvBound := p.config.QueueWaitKVCacheThreshold > 0 && metrics.KVCacheUsagePercent >= p.config.QueueWaitKVCacheThreshold
+	if !slotBound && !kvBound {
 		return 0
 	}
 	rate := max(load.CompletionsPerSecond, minCompletionsPerSecond)
 	return float64(metrics.WaitingQueueSize) / rate * 1000
+}
+
+// hasFreeEndpoint reports whether any endpoint has at most maxWaiting waiting
+// requests. When every endpoint is queued, moving a request off its sticky
+// endpoint does not shorten its wait and adds the prefill of its lost cache, so
+// the queue wait term is left out.
+func hasFreeEndpoint(endpoints []fwksched.Endpoint, maxWaiting int) bool {
+	for _, ep := range endpoints {
+		if metrics := ep.GetMetrics(); metrics != nil && metrics.WaitingQueueSize <= maxWaiting {
+			return true
+		}
+	}
+	return false
 }
 
 // inFlightLoad returns an endpoint's in-flight load. If the attribute is absent,
