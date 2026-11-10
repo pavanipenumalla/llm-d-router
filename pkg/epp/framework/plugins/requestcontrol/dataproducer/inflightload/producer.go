@@ -113,6 +113,7 @@ func InFlightLoadProducerFactory(name string, decoder *json.Decoder, handle fwkp
 		typedName:                 fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: name},
 		requestTracker:            newConcurrencyTracker(),
 		tokenTracker:              newConcurrencyTracker(),
+		pendingTracker:            newConcurrencyTracker(),
 		completionTracker:         newCompletionTracker(),
 		tokenEstimator:            NewSimpleTokenEstimator(cfg.MaxEstimatedOutputTokens),
 		addEstimatedOutputTokens:  cfg.AddEstimatedOutputTokens,
@@ -140,6 +141,7 @@ type InFlightLoadProducer struct {
 	typedName                fwkplugin.TypedName
 	requestTracker           *concurrencyTracker
 	tokenTracker             *concurrencyTracker
+	pendingTracker           *concurrencyTracker
 	completionTracker        *completionTracker
 	tokenEstimator           TokenEstimator
 	addEstimatedOutputTokens bool
@@ -174,12 +176,15 @@ type addedTokensEntry struct {
 	// counter; decrementing it leaves the live counter untouched.
 	tokenCounter   *atomic.Int64
 	requestCounter *atomic.Int64
+	pendingCounter *atomic.Int64
 	requests       atomic.Int32
 	endpointName   string
 	namespace      string
 	producerName   string
 	fairnessID     string
 	priority       string
+	// pending is 1 while the request's tokens are counted, even when they are 0.
+	pending atomic.Int32
 }
 
 var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
@@ -195,6 +200,7 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 	clone := &addedTokensEntry{
 		tokenCounter:   e.tokenCounter,
 		requestCounter: e.requestCounter,
+		pendingCounter: e.pendingCounter,
 		endpointName:   e.endpointName,
 		namespace:      e.namespace,
 		producerName:   e.producerName,
@@ -203,17 +209,27 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 	}
 	clone.tokens.Store(e.tokens.Load())
 	clone.requests.Store(e.requests.Load())
+	clone.pending.Store(e.pending.Load())
 	return clone
 }
 
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
+	e.releaseTokens()
+	if e.requests.Swap(0) != 0 {
+		decrementClamped(e.requestCounter, 1)
+		inflightRequests.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Dec()
+	}
+}
+
+// releaseTokens rolls back the entry's token contribution and its pending count
+// exactly once.
+func (e *addedTokensEntry) releaseTokens() {
 	if t := e.tokens.Swap(0); t != 0 {
 		decrementClamped(e.tokenCounter, t)
 		inflightTokens.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Sub(float64(t))
 	}
-	if e.requests.Swap(0) != 0 {
-		decrementClamped(e.requestCounter, 1)
-		inflightRequests.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Dec()
+	if e.pending.Swap(0) != 0 {
+		decrementClamped(e.pendingCounter, 1)
 	}
 }
 
@@ -326,6 +342,7 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 			return &attrconcurrency.InFlightLoad{
 				Requests:             p.requestTracker.get(endpointID),
 				Tokens:               p.tokenTracker.get(endpointID),
+				PendingRequests:      p.pendingTracker.get(endpointID),
 				CompletionsPerSecond: p.completionTracker.rate(endpointID, time.Now()),
 			}
 		},
@@ -335,6 +352,7 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 				if ifl, ok := v.(*attrconcurrency.InFlightLoad); ok {
 					total.Requests += ifl.Requests
 					total.Tokens += ifl.Tokens
+					total.PendingRequests += ifl.PendingRequests
 					total.CompletionsPerSecond += ifl.CompletionsPerSecond
 				}
 			}
@@ -374,11 +392,13 @@ func (p *InFlightLoadProducer) Extract(ctx context.Context, event datalayer.Endp
 		log.FromContext(ctx).V(logutil.DEFAULT).Info("Cleaned up in-flight load for deleted endpoint", "endpoint", id)
 	case datalayer.EventAddOrUpdate:
 		p.registeredEndpoints.Store(id, event.Endpoint)
+		p.completionTracker.add(id)
 		event.Endpoint.GetAttributes().Put(p.dk, &datalayer.DynamicAttribute{
 			Get: func() datalayer.Cloneable {
 				return &attrconcurrency.InFlightLoad{
 					Tokens:               p.GetTokens(id),
 					Requests:             p.GetRequests(id),
+					PendingRequests:      p.pendingTracker.get(id),
 					CompletionsPerSecond: p.completionTracker.rate(id, time.Now()),
 				}
 			},
@@ -477,6 +497,7 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		tokens := p.estimateRequestTokens(endpoint, request, inputTokens)
 
 		tokenCounter := p.tokenTracker.add(eid, tokens)
+		pendingCounter := p.pendingTracker.inc(eid)
 
 		inflightRequests.WithLabelValues(name, namespace, p.typedName.Name, fairnessID, priority).Inc()
 		inflightTokens.WithLabelValues(name, namespace, p.typedName.Name, fairnessID, priority).Add(float64(tokens))
@@ -484,6 +505,7 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		entry := &addedTokensEntry{
 			tokenCounter:   tokenCounter,
 			requestCounter: requestCounter,
+			pendingCounter: pendingCounter,
 			endpointName:   name,
 			namespace:      namespace,
 			producerName:   p.typedName.Name,
@@ -492,6 +514,7 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		}
 		entry.tokens.Store(tokens)
 		entry.requests.Store(1)
+		entry.pending.Store(1)
 		p.PluginState.Write(
 			request.RequestID,
 			fwkplugin.StateKey(addedTokensKey(eid, profileName)),
@@ -735,10 +758,7 @@ func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, re
 
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
-		if t := entry.tokens.Swap(0); t != 0 {
-			decrementClamped(entry.tokenCounter, t)
-			inflightTokens.WithLabelValues(entry.endpointName, entry.namespace, entry.producerName, entry.fairnessID, entry.priority).Sub(float64(t))
-		}
+		entry.releaseTokens()
 	}
 }
 
@@ -828,6 +848,7 @@ func (p *InFlightLoadProducer) Consumes() fwkplugin.DataDependencies {
 func (p *InFlightLoadProducer) DeleteEndpoint(endpointID string) {
 	p.requestTracker.delete(endpointID)
 	p.tokenTracker.delete(endpointID)
+	p.pendingTracker.delete(endpointID)
 	p.completionTracker.delete(endpointID)
 }
 

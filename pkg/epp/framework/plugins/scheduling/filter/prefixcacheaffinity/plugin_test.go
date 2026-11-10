@@ -137,27 +137,22 @@ func TestFilter_ThroughputTTFTWithinThreshold(t *testing.T) {
 	assert.Equal(t, "a", result[0].GetMetadata().ID.Name)
 }
 
-// makeQueuedEndpoint creates a test endpoint whose model server reports running
-// and waiting requests and whose in-flight load carries completionsPerSecond.
-func makeQueuedEndpoint(name string, prefixMatch int, tokens int64, running, waiting int, completionsPerSecond float64) fwksched.Endpoint {
-	return makeKVQueuedEndpoint(name, prefixMatch, tokens, running, waiting, completionsPerSecond, 0)
-}
-
-// makeKVQueuedEndpoint is makeQueuedEndpoint with the model server's KV cache usage.
-func makeKVQueuedEndpoint(name string, prefixMatch int, tokens int64, running, waiting int, completionsPerSecond, kvCacheUsage float64) fwksched.Endpoint {
+// makeQueuedEndpoint creates a test endpoint with the EPP's in-flight load and
+// the model server's waiting queue and KV cache usage.
+func makeQueuedEndpoint(name string, prefixMatch int, load attrconcurrency.InFlightLoad, waiting int, kvCacheUsage float64) fwksched.Endpoint {
 	meta := &fwkdl.EndpointMetadata{
 		ID: types.NamespacedName{Name: name, Namespace: "default"},
 	}
-	metrics := &fwkdl.Metrics{RunningRequestsSize: running, WaitingQueueSize: waiting, KVCacheUsagePercent: kvCacheUsage}
+	metrics := &fwkdl.Metrics{WaitingQueueSize: waiting, KVCacheUsagePercent: kvCacheUsage}
 	ep := fwksched.NewEndpoint(meta, metrics, fwkdl.NewAttributes())
 	ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, 100, 16))
-	ep.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Tokens: tokens, CompletionsPerSecond: completionsPerSecond})
+	ep.Put(attrconcurrency.InFlightLoadDataKey, &load)
 	ep.Put(attrconcurrency.UncachedRequestTokensDataKey, &attrconcurrency.UncachedRequestTokens{Tokens: 0})
 	return ep
 }
 
 // With PeakPrefillThroughput=1000 tokens/sec, 1000 in-flight tokens map to 1000ms;
-// a slot-bound endpoint adds waiting / completionsPerSecond seconds.
+// each queued request adds 1 / completionsPerSecond seconds.
 func TestEndpointTTFT_QueueWait(t *testing.T) {
 	full := Config{TTFTSource: TTFTSourcePrefillThroughput, PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 64}
 	backlog := full
@@ -166,31 +161,43 @@ func TestEndpointTTFT_QueueWait(t *testing.T) {
 	noLimit.MaxNumSeqs = 0
 	kv := noLimit
 	kv.QueueWaitKVCacheThreshold = 0.95
+	fullKV := full
+	fullKV.QueueWaitKVCacheThreshold = 0.95
 	for _, tc := range []struct {
-		name                 string
-		config               Config
-		running, waiting     int
-		completionsPerSecond float64
-		kvCacheUsage         float64
-		withoutQueueWait     bool
-		want                 float64
+		name         string
+		config       Config
+		load         attrconcurrency.InFlightLoad
+		waiting      int
+		kvCacheUsage float64
+		want         float64
 	}{
-		{name: "slots full", config: full, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000 + 61/1.6*1000},
-		{name: "one slot free", config: full, running: 63, waiting: 61, completionsPerSecond: 1.6, want: 1000 + 61/1.6*1000},
-		{name: "waiting for prefill budget", config: full, running: 10, waiting: 3, completionsPerSecond: 1.6, want: 1000},
-		{name: "slots full without completions", config: full, running: 64, waiting: 2, completionsPerSecond: 0, want: 1000 + 2*30*1000},
-		{name: "slots full without queue", config: full, running: 64, waiting: 0, completionsPerSecond: 1.6, want: 1000},
-		{name: "backlog ignores queue", config: backlog, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000},
-		{name: "no running limit configured", config: noLimit, running: 64, waiting: 61, completionsPerSecond: 1.6, want: 1000},
-		{name: "KV cache full", config: kv, running: 20, waiting: 8, completionsPerSecond: 2, kvCacheUsage: 0.97, want: 1000 + 8/2.0*1000},
-		{name: "KV cache below threshold", config: kv, running: 20, waiting: 8, completionsPerSecond: 2, kvCacheUsage: 0.90, want: 1000},
-		{name: "KV threshold not configured", config: noLimit, running: 20, waiting: 8, completionsPerSecond: 2, kvCacheUsage: 0.97, want: 1000},
-		{name: "no free endpoint", config: full, running: 64, waiting: 61, completionsPerSecond: 1.6, withoutQueueWait: true, want: 1000},
+		{name: "no queue", config: full,
+			load: attrconcurrency.InFlightLoad{Requests: 64, PendingRequests: 2, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "requests beyond the running limit", config: full,
+			load: attrconcurrency.InFlightLoad{Requests: 74, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 10 / 2.0 * 1000},
+		{name: "queued share of pending tokens left out", config: full,
+			load: attrconcurrency.InFlightLoad{Requests: 68, PendingRequests: 8, Tokens: 1000, CompletionsPerSecond: 2}, want: 500 + 4/2.0*1000},
+		{name: "queued requests without completions", config: full,
+			load: attrconcurrency.InFlightLoad{Requests: 66, PendingRequests: 4, Tokens: 1000}, want: 500 + 2*30*1000},
+		{name: "scraped waiting ignored below the KV threshold", config: full, waiting: 20,
+			load: attrconcurrency.InFlightLoad{Requests: 10, PendingRequests: 2, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "backlog ignores queue", config: backlog,
+			load: attrconcurrency.InFlightLoad{Requests: 74, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "no running limit configured", config: noLimit,
+			load: attrconcurrency.InFlightLoad{Requests: 74, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "KV cache full", config: kv, waiting: 8, kvCacheUsage: 0.97,
+			load: attrconcurrency.InFlightLoad{Requests: 20, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 200 + 8/2.0*1000},
+		{name: "KV cache below threshold", config: kv, waiting: 8, kvCacheUsage: 0.90,
+			load: attrconcurrency.InFlightLoad{Requests: 20, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "KV threshold not configured", config: noLimit, waiting: 8, kvCacheUsage: 0.97,
+			load: attrconcurrency.InFlightLoad{Requests: 20, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 1000},
+		{name: "larger of slot queue and KV waiting", config: fullKV, waiting: 3, kvCacheUsage: 0.97,
+			load: attrconcurrency.InFlightLoad{Requests: 69, PendingRequests: 10, Tokens: 1000, CompletionsPerSecond: 2}, want: 500 + 5/2.0*1000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newTestPlugin(tc.config)
-			ep := makeKVQueuedEndpoint("a", 90, 1000, tc.running, tc.waiting, tc.completionsPerSecond, tc.kvCacheUsage)
-			ttft, ok := p.endpointTTFT(ep, !tc.withoutQueueWait)
+			ep := makeQueuedEndpoint("a", 90, tc.load, tc.waiting, tc.kvCacheUsage)
+			ttft, ok := p.endpointTTFT(ep)
 			assert.True(t, ok)
 			assert.InDelta(t, tc.want, ttft, 1e-6)
 		})
@@ -203,37 +210,25 @@ func TestFilter_QueueWaitBreaksStickiness(t *testing.T) {
 	p := newTestPlugin(Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourcePrefillThroughput,
 		PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 64})
 	endpoints := []fwksched.Endpoint{
-		makeQueuedEndpoint("a", 90, 100, 64, 61, 1.6),
-		makeQueuedEndpoint("b", 10, 0, 0, 0, 0),
+		makeQueuedEndpoint("a", 90, attrconcurrency.InFlightLoad{Requests: 85, PendingRequests: 21, Tokens: 100, CompletionsPerSecond: 1.6}, 21, 0),
+		makeQueuedEndpoint("b", 10, attrconcurrency.InFlightLoad{}, 0, 0),
 	}
 	result := p.Filter(context.Background(), nil, endpoints)
 	assert.Equal(t, 2, len(result), "queue wait should break stickiness")
 }
 
-// When no endpoint has at most FreeEndpointMaxWaiting waiting requests, the queue
-// wait is left out on every endpoint, so a sticky endpoint with a longer queue
-// than the others stays sticky.
-func TestFilter_QueueWaitNeedsFreeEndpoint(t *testing.T) {
-	config := Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourcePrefillThroughput,
-		PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 8, FreeEndpointMaxWaiting: 2}
-	for _, tc := range []struct {
-		name          string
-		otherWaiting  int
-		wantEndpoints int
-	}{
-		{name: "other endpoint free", otherWaiting: 2, wantEndpoints: 2},
-		{name: "every endpoint queued", otherWaiting: 3, wantEndpoints: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p := newTestPlugin(config)
-			endpoints := []fwksched.Endpoint{
-				makeQueuedEndpoint("a", 90, 100, 8, 20, 0.5),
-				makeQueuedEndpoint("b", 10, 0, 8, tc.otherWaiting, 10),
-			}
-			result := p.Filter(context.Background(), nil, endpoints)
-			assert.Equal(t, tc.wantEndpoints, len(result))
-		})
+// Equal queues on every endpoint give equal queue waits, so the sticky endpoint
+// stays sticky.
+func TestFilter_EqualQueuesKeepStickiness(t *testing.T) {
+	p := newTestPlugin(Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull, MaxNumSeqs: 8})
+	load := attrconcurrency.InFlightLoad{Requests: 28, PendingRequests: 22, Tokens: 1000, CompletionsPerSecond: 0.5}
+	endpoints := []fwksched.Endpoint{
+		makeQueuedEndpoint("a", 90, load, 20, 0),
+		makeQueuedEndpoint("b", 10, load, 20, 0),
 	}
+	result := p.Filter(context.Background(), nil, endpoints)
+	assert.Equal(t, 1, len(result))
 }
 
 func TestFilter_TTFTPenaltyDisabled(t *testing.T) {
@@ -507,10 +502,17 @@ func TestFactory_InvalidQueueWaitKVCacheThreshold(t *testing.T) {
 	}
 }
 
-func TestFactory_NegativeFreeEndpointMaxWaiting(t *testing.T) {
-	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"freeEndpointMaxWaiting": -1}`)), nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "freeEndpointMaxWaiting must be")
+func TestFactory_DefaultQueueWaitKVCacheThreshold(t *testing.T) {
+	plugin, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{}`)), nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.95, plugin.(*Plugin).config.QueueWaitKVCacheThreshold)
+
+	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"queueWaitKVCacheThreshold": 0}`)), nil)
+	assert.NoError(t, err)
+	assert.Zero(t, plugin.(*Plugin).config.QueueWaitKVCacheThreshold, "an explicit 0 turns the KV queue wait off")
+
+	_, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"freeEndpointMaxWaiting": 2}`)), nil)
+	assert.Error(t, err, "freeEndpointMaxWaiting is no longer a parameter")
 }
 
 // An empty ttftSource is rejected rather than silently defaulted: the default is

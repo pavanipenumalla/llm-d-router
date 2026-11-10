@@ -19,6 +19,7 @@ package prefixcacheaffinity
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	compbasemetrics "k8s.io/component-base/metrics"
@@ -57,6 +58,33 @@ var filterDecisions = prometheus.NewCounterVec(
 	[]string{"plugin_name", "outcome"},
 )
 
+// ttftBuckets are the histogram buckets, in seconds, for the estimated and the
+// actual TTFT of a request.
+var ttftBuckets = []float64{
+	0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 45,
+	60, 90, 120, 180, 300, 600,
+}
+
+var estimatedTTFT = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "prefix_cache_affinity_filter_estimated_ttft_seconds",
+		Help:      metricsutil.HelpMsgWithStability("TTFT the filter estimated for the endpoint that served the request, in seconds.", compbasemetrics.ALPHA),
+		Buckets:   ttftBuckets,
+	},
+	[]string{"plugin_name"},
+)
+
+var actualTTFT = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "prefix_cache_affinity_filter_actual_ttft_seconds",
+		Help:      metricsutil.HelpMsgWithStability("TTFT measured from the filter's decision to the first response chunk, for requests with an estimate, in seconds.", compbasemetrics.ALPHA),
+		Buckets:   ttftBuckets,
+	},
+	[]string{"plugin_name"},
+)
+
 // registerMetrics registers the filter collectors on the given registerer. A nil
 // registerer is a no-op, so the filter runs without metrics when the handle
 // supplies no recorder. Repeated registration of the same collector is tolerated.
@@ -64,12 +92,14 @@ func registerMetrics(registerer prometheus.Registerer) error {
 	if registerer == nil {
 		return nil
 	}
-	if err := registerer.Register(filterDecisions); err != nil {
-		var alreadyRegistered prometheus.AlreadyRegisteredError
-		if errors.As(err, &alreadyRegistered) && alreadyRegistered.ExistingCollector == filterDecisions {
-			return nil
+	for _, collector := range []prometheus.Collector{filterDecisions, estimatedTTFT, actualTTFT} {
+		if err := registerer.Register(collector); err != nil {
+			var alreadyRegistered prometheus.AlreadyRegisteredError
+			if errors.As(err, &alreadyRegistered) && alreadyRegistered.ExistingCollector == collector {
+				continue
+			}
+			return fmt.Errorf("register prefix cache affinity filter metric: %w", err)
 		}
-		return fmt.Errorf("register prefix cache affinity filter metric: %w", err)
 	}
 	return nil
 }
@@ -78,7 +108,15 @@ func recordDecision(pluginName, outcome string) {
 	filterDecisions.WithLabelValues(pluginName, outcome).Inc()
 }
 
+// recordTTFT records a request's estimated and actual TTFT.
+func recordTTFT(pluginName string, estimated, actual time.Duration) {
+	estimatedTTFT.WithLabelValues(pluginName).Observe(estimated.Seconds())
+	actualTTFT.WithLabelValues(pluginName).Observe(actual.Seconds())
+}
+
 // resetMetrics clears the collectors between tests.
 func resetMetrics() {
 	filterDecisions.Reset()
+	estimatedTTFT.Reset()
+	actualTTFT.Reset()
 }

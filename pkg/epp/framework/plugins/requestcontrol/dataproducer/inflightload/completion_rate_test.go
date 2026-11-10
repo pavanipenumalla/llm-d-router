@@ -38,33 +38,45 @@ func TestCompletionTracker(t *testing.T) {
 			want: 0,
 		},
 		{
-			name:    "completions in one second",
-			records: []time.Duration{0, 0, 0},
-			want:    3.0 / completionWindowSeconds,
+			name:    "enough completions in the short window",
+			records: []time.Duration{0, 0, 0, 0, 0},
+			want:    5.0 / completionWindowSeconds,
 		},
 		{
-			name:    "completions spread over the window",
-			records: []time.Duration{0, 10 * time.Second, 29 * time.Second},
+			name:    "completions spread over the short window",
+			records: []time.Duration{0, 5 * time.Second, 10 * time.Second, 20 * time.Second, 29 * time.Second},
 			readAt:  29 * time.Second,
-			want:    3.0 / completionWindowSeconds,
+			want:    5.0 / completionWindowSeconds,
 		},
 		{
-			name:    "completions older than the window are excluded",
+			name:    "few completions use the fallback window",
+			records: []time.Duration{0, 0, 0},
+			want:    3.0 / completionFallbackWindowSeconds,
+		},
+		{
+			name:    "fallback window includes older completions",
+			records: []time.Duration{0, 0, 0, 0, 90 * time.Second},
+			readAt:  100 * time.Second,
+			want:    5.0 / completionFallbackWindowSeconds,
+		},
+		{
+			name:    "completions older than the fallback window are excluded",
 			records: []time.Duration{0, 5 * time.Second},
-			readAt:  32 * time.Second,
-			want:    1.0 / completionWindowSeconds,
+			readAt:  122 * time.Second,
+			want:    1.0 / completionFallbackWindowSeconds,
 		},
 		{
 			name:    "reused bucket starts from zero",
-			records: []time.Duration{0, 0, completionWindowSeconds * time.Second},
-			readAt:  completionWindowSeconds * time.Second,
-			want:    1.0 / completionWindowSeconds,
+			records: []time.Duration{0, 0, completionFallbackWindowSeconds * time.Second},
+			readAt:  completionFallbackWindowSeconds * time.Second,
+			want:    1.0 / completionFallbackWindowSeconds,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := newCompletionTracker()
+			tr.add("ep")
 			for _, off := range tt.records {
 				tr.record("ep", t0.Add(off))
 			}
@@ -76,22 +88,32 @@ func TestCompletionTracker(t *testing.T) {
 func TestCompletionTrackerEndpoints(t *testing.T) {
 	t0 := time.Unix(1_000_000, 0)
 	tr := newCompletionTracker()
+	tr.add("a")
+	tr.add("b")
 	tr.record("a", t0)
 	tr.record("a", t0)
 	tr.record("b", t0)
 
-	require.InDelta(t, 2.0/completionWindowSeconds, tr.rate("a", t0), 1e-9)
-	require.InDelta(t, 1.0/completionWindowSeconds, tr.rate("b", t0), 1e-9)
+	require.InDelta(t, 2.0/completionFallbackWindowSeconds, tr.rate("a", t0), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, tr.rate("b", t0), 1e-9)
 	require.Zero(t, tr.rate("unknown", t0))
+
+	tr.add("a")
+	require.InDelta(t, 2.0/completionFallbackWindowSeconds, tr.rate("a", t0), 1e-9, "adding a registered endpoint keeps its window")
 
 	tr.delete("a")
 	require.Zero(t, tr.rate("a", t0))
-	require.InDelta(t, 1.0/completionWindowSeconds, tr.rate("b", t0), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, tr.rate("b", t0), 1e-9)
+
+	tr.record("a", t0)
+	require.Zero(t, tr.rate("a", t0), "a completion after delete does not recreate the window")
+	require.NotContains(t, tr.windows, "a")
 }
 
 func TestCompletionTrackerConcurrent(t *testing.T) {
 	t0 := time.Unix(1_000_000, 0)
 	tr := newCompletionTracker()
+	tr.add("ep")
 
 	const workers, perWorker = 8, 100
 	var wg sync.WaitGroup

@@ -772,17 +772,57 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease(t *testin
 	_ = producer.PreRequest(ctx, req, res)
 	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
 	require.Equal(t, int64(4), producer.tokenTracker.get(endpointID), "only input tokens should be tracked")
+	require.Equal(t, int64(1), producer.pendingTracker.get(endpointID))
 
 	// First chunk arrives: tokens released, request still in flight.
 	req.SchedulingResult = res
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
 	require.Equal(t, int64(1), producer.requestTracker.get(endpointID), "request counter should still be held")
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID), "tokens should be released at StartOfStream")
+	require.Equal(t, int64(0), producer.pendingTracker.get(endpointID), "the request is no longer pending after its first chunk")
 
 	// EndOfStream releases the request counter.
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
 	require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+	require.Equal(t, int64(0), producer.pendingTracker.get(endpointID))
+}
+
+// TestInFlightLoadProducer_PendingRequests verifies that a request is pending
+// while its tokens are counted, also when they are 0 (a full cache hit), and
+// that the pending count is released once on every path.
+func TestInFlightLoadProducer_PendingRequests(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	producer.addEstimatedOutputTokens = false
+	ctx := context.Background()
+	endpoint := newStubSchedulingEndpoint("pending-endpoint")
+	require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{Type: datalayer.EventAddOrUpdate, Endpoint: endpoint}))
+	res := makeSchedulingResult("pending-endpoint")
+
+	pendingRequests := func() int64 {
+		val, ok := endpoint.Get(producer.dk)
+		require.True(t, ok)
+		return val.(*attrconcurrency.InFlightLoad).PendingRequests
+	}
+
+	cached := makeTokenRequest("pending-cached", 0)
+	require.NoError(t, producer.PreRequest(ctx, cached, res))
+	reaped := makeTokenRequest("pending-reaped", 4)
+	require.NoError(t, producer.PreRequest(ctx, reaped, res))
+	require.Equal(t, int64(2), pendingRequests(), "a request with 0 tokens is still pending")
+
+	cached.SchedulingResult = res
+	producer.ResponseBody(ctx, cached, &requestcontrol.Response{StartOfStream: true}, nil)
+	producer.ResponseBody(ctx, cached, &requestcontrol.Response{EndOfStream: true}, nil)
+	require.Equal(t, int64(1), pendingRequests())
+
+	producer.PluginState.Delete(reaped.RequestID)
+	require.Equal(t, int64(0), pendingRequests(), "the janitor releases the pending count")
+	reaped.SchedulingResult = res
+	producer.ResponseBody(ctx, reaped, &requestcontrol.Response{EndOfStream: true}, nil)
+	require.Equal(t, int64(0), pendingRequests(), "a late end of stream does not release it twice")
 }
 
 // TestInFlightLoadProducer_ExcludeOutputTokens_PrefillReleasedAtStartOfStream verifies
@@ -1588,10 +1628,43 @@ func TestInFlightLoadProducer_CompletionRate(t *testing.T) {
 	require.Zero(t, completionsPerSecond(), "a request that has not ended is not a completion")
 
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
-	require.InDelta(t, 1.0/completionWindowSeconds, completionsPerSecond(), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, completionsPerSecond(), 1e-9)
 
 	require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{Type: datalayer.EventDelete, Endpoint: endpoint}))
 	require.Zero(t, producer.completionTracker.rate(endpointID, time.Now()), "deleting an endpoint clears its rate")
+
+	late := makeTokenRequest("rate-req-late", 4)
+	require.NoError(t, producer.PreRequest(ctx, late, res))
+	late.SchedulingResult = res
+	producer.ResponseBody(ctx, late, &requestcontrol.Response{EndOfStream: true}, nil)
+	require.Zero(t, producer.completionTracker.rate(endpointID, time.Now()), "a completion after delete does not recreate the window")
+}
+
+// TestInFlightLoadProducer_CompletionRate_AbortedStream verifies that a request
+// whose stream ends early (client disconnect or error) counts as a completion:
+// the director runs the end-of-stream hooks for it with the termination cause.
+func TestInFlightLoadProducer_CompletionRate_AbortedStream(t *testing.T) {
+	t.Parallel()
+
+	for _, cause := range []requestcontrol.TerminationCause{requestcontrol.TerminationCauseClientDisconnect, requestcontrol.TerminationCauseError} {
+		t.Run(string(cause), func(t *testing.T) {
+			t.Parallel()
+			producer := newTestProducer(t)
+			ctx := context.Background()
+			endpoint := newStubSchedulingEndpoint("aborted-endpoint")
+			endpointID := fullEndpointName("aborted-endpoint")
+			require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{Type: datalayer.EventAddOrUpdate, Endpoint: endpoint}))
+
+			res := makeSchedulingResult("aborted-endpoint")
+			req := makeTokenRequest("aborted-req", 4)
+			require.NoError(t, producer.PreRequest(ctx, req, res))
+			req.SchedulingResult = res
+
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true, EndOfStream: true, TerminationCause: cause}, nil)
+			require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(endpointID, time.Now()), 1e-9)
+			require.Zero(t, producer.requestTracker.get(endpointID))
+		})
+	}
 }
 
 // TestInFlightLoadProducer_CompletionRate_PD verifies that a prefill endpoint completes
@@ -1603,6 +1676,9 @@ func TestInFlightLoadProducer_CompletionRate_PD(t *testing.T) {
 	ctx := context.Background()
 	prefillID := fullEndpointName("prefill-endpoint")
 	decodeID := fullEndpointName("decode-endpoint")
+
+	producer.completionTracker.add(prefillID)
+	producer.completionTracker.add(decodeID)
 
 	req := makeTokenRequest("rate-req-pd", 4)
 	res := &fwksched.SchedulingResult{
@@ -1616,12 +1692,12 @@ func TestInFlightLoadProducer_CompletionRate_PD(t *testing.T) {
 	req.SchedulingResult = res
 
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
-	require.InDelta(t, 1.0/completionWindowSeconds, producer.completionTracker.rate(prefillID, time.Now()), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(prefillID, time.Now()), 1e-9)
 	require.Zero(t, producer.completionTracker.rate(decodeID, time.Now()))
 
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
-	require.InDelta(t, 1.0/completionWindowSeconds, producer.completionTracker.rate(prefillID, time.Now()), 1e-9)
-	require.InDelta(t, 1.0/completionWindowSeconds, producer.completionTracker.rate(decodeID, time.Now()), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(prefillID, time.Now()), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(decodeID, time.Now()), 1e-9)
 }
 
 // TestInFlightLoadProducer_CompletionRate_ProfilesSameEndpoint verifies that a request
@@ -1632,6 +1708,7 @@ func TestInFlightLoadProducer_CompletionRate_ProfilesSameEndpoint(t *testing.T) 
 	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointID := fullEndpointName("shared-endpoint")
+	producer.completionTracker.add(endpointID)
 
 	req := makeTokenRequest("rate-req-shared", 4)
 	res := &fwksched.SchedulingResult{
@@ -1645,7 +1722,7 @@ func TestInFlightLoadProducer_CompletionRate_ProfilesSameEndpoint(t *testing.T) 
 	req.SchedulingResult = res
 
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true, EndOfStream: true}, nil)
-	require.InDelta(t, 1.0/completionWindowSeconds, producer.completionTracker.rate(endpointID, time.Now()), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(endpointID, time.Now()), 1e-9)
 }
 
 // TestInFlightLoadProducer_CompletionRate_PDSameEndpoint verifies that a request
@@ -1657,6 +1734,7 @@ func TestInFlightLoadProducer_CompletionRate_PDSameEndpoint(t *testing.T) {
 	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointID := fullEndpointName("shared-endpoint")
+	producer.completionTracker.add(endpointID)
 
 	req := makeTokenRequest("rate-req-pd-shared", 4)
 	res := &fwksched.SchedulingResult{
@@ -1673,7 +1751,7 @@ func TestInFlightLoadProducer_CompletionRate_PDSameEndpoint(t *testing.T) {
 	require.Zero(t, producer.completionTracker.rate(endpointID, time.Now()))
 
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
-	require.InDelta(t, 1.0/completionWindowSeconds, producer.completionTracker.rate(endpointID, time.Now()), 1e-9)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, producer.completionTracker.rate(endpointID, time.Now()), 1e-9)
 }
 
 func TestInFlightLoadProducer_CrossReplicaState(t *testing.T) {
@@ -1685,17 +1763,21 @@ func TestInFlightLoadProducer_CrossReplicaState(t *testing.T) {
 
 	producer.requestTracker.add(endpointID, 2)
 	producer.tokenTracker.add(endpointID, 200)
+	producer.pendingTracker.add(endpointID, 1)
+	producer.completionTracker.add(endpointID)
 	producer.completionTracker.record(endpointID, time.Now())
 	supplied := spec.Read(endpointID).(*attrconcurrency.InFlightLoad)
 	require.Equal(t, int64(2), supplied.Requests)
 	require.Equal(t, int64(200), supplied.Tokens)
-	require.InDelta(t, 1.0/completionWindowSeconds, supplied.CompletionsPerSecond, 1e-9)
+	require.Equal(t, int64(1), supplied.PendingRequests)
+	require.InDelta(t, 1.0/completionFallbackWindowSeconds, supplied.CompletionsPerSecond, 1e-9)
 
 	total := spec.Aggregate([]any{
-		&attrconcurrency.InFlightLoad{Requests: 1, Tokens: 100, CompletionsPerSecond: 0.5},
-		&attrconcurrency.InFlightLoad{Requests: 2, Tokens: 200, CompletionsPerSecond: 0.25},
+		&attrconcurrency.InFlightLoad{Requests: 1, Tokens: 100, PendingRequests: 1, CompletionsPerSecond: 0.5},
+		&attrconcurrency.InFlightLoad{Requests: 2, Tokens: 200, PendingRequests: 2, CompletionsPerSecond: 0.25},
 	}).(*attrconcurrency.InFlightLoad)
 	require.Equal(t, int64(3), total.Requests)
 	require.Equal(t, int64(300), total.Tokens)
+	require.Equal(t, int64(3), total.PendingRequests)
 	require.InDelta(t, 0.75, total.CompletionsPerSecond, 1e-9)
 }

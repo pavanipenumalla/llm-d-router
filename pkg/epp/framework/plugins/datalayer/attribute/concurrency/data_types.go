@@ -48,6 +48,11 @@ type InFlightLoad struct {
 	// maintained with the same lifecycle as Tokens.
 	Requests int64
 
+	// PendingRequests is the number of in-flight requests whose tokens are still
+	// counted in Tokens: until the first chunk, or until end of stream when
+	// estimated output tokens are added.
+	PendingRequests int64
+
 	// CompletionsPerSecond is the rate at which requests sent to this endpoint
 	// finished there, averaged over the producer's completion window.
 	CompletionsPerSecond float64

@@ -26,8 +26,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -36,7 +38,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
@@ -48,7 +52,25 @@ const (
 	PluginType = "prefix-cache-affinity-filter"
 )
 
-var _ fwksched.Filter = &Plugin{}
+var (
+	_ fwksched.Filter                      = &Plugin{}
+	_ requestcontrol.ResponseBodyProcessor = &Plugin{}
+)
+
+// ttftEstimateStateKey is the PluginState key of a request's per-endpoint TTFT
+// estimates, read back at the first response chunk.
+const ttftEstimateStateKey = fwkplugin.StateKey("ttft-estimates")
+
+// ttftEstimates holds the TTFT estimated for each candidate endpoint when the
+// filter ran, keyed by endpoint ID, and the time it ran.
+type ttftEstimates struct {
+	byEndpoint map[string]time.Duration
+	at         time.Time
+}
+
+func (e *ttftEstimates) Clone() fwkplugin.StateData {
+	return &ttftEstimates{byEndpoint: maps.Clone(e.byEndpoint), at: e.at}
+}
 
 // TTFTSource selects the per-endpoint TTFT signal used by the load gate. The
 // choice also determines which producer attribute the filter consumes.
@@ -76,8 +98,9 @@ const (
 	TTFTEstimateFull TTFTEstimate = "full"
 )
 
-// minCompletionsPerSecond is one completion in the inflight-load-producer's
-// 30 s window, the rate assumed for a slot-bound endpoint that finished nothing.
+// minCompletionsPerSecond is the lowest completion rate assumed for an endpoint
+// with queued requests, so that an endpoint that finished nothing in the
+// inflight-load-producer's window still gets a finite queue wait.
 const minCompletionsPerSecond = 1.0 / 30
 
 type Config struct {
@@ -114,18 +137,13 @@ type Config struct {
 
 	// MaxNumSeqs is the model server's limit on running requests (vLLM
 	// max_num_seqs). With TTFTEstimateFull, a value > 0 adds the wait for a
-	// running slot to the estimate when the endpoint is slot-bound; 0 leaves it out.
+	// running slot for the EPP's in-flight requests beyond it; 0 leaves it out.
 	MaxNumSeqs int `json:"maxNumSeqs,omitempty"`
 
-	// QueueWaitKVCacheThreshold is the KV cache usage, in (0, 1], at or above which
-	// an endpoint with waiting requests is KV-bound. With TTFTEstimateFull, a value
-	// > 0 adds the queue wait to a KV-bound endpoint's estimate; 0 leaves it out.
+	// QueueWaitKVCacheThreshold is the KV cache usage, in [0, 1], at or above which
+	// an endpoint's waiting requests wait for KV cache. With TTFTEstimateFull, a
+	// value > 0 adds their wait to the estimate; 0 leaves it out. Default: 0.95.
 	QueueWaitKVCacheThreshold float64 `json:"queueWaitKVCacheThreshold,omitempty"`
-
-	// FreeEndpointMaxWaiting is the largest waiting queue at which an endpoint
-	// counts as free. The queue wait is added only while at least one candidate
-	// endpoint is free. Default: 2.
-	FreeEndpointMaxWaiting int `json:"freeEndpointMaxWaiting,omitempty"`
 
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
@@ -139,9 +157,9 @@ var DefaultConfig = Config{
 	TTFTSource:             TTFTSourcePrefillThroughput,
 
 	// Calibrated for Qwen 32B on 2x H100 80GB (TP=2), vLLM 0.19; see README.
-	PeakPrefillThroughput:  15928,
-	TTFTEstimate:           TTFTEstimateBackLog,
-	FreeEndpointMaxWaiting: 2,
+	PeakPrefillThroughput:     15928,
+	TTFTEstimate:              TTFTEstimateBackLog,
+	QueueWaitKVCacheThreshold: 0.95,
 }
 
 type Plugin struct {
@@ -151,6 +169,9 @@ type Plugin struct {
 	latencyPredictionInfoDataKey fwkplugin.DataKey
 	inFlightLoadDataKey          fwkplugin.DataKey
 	uncachedRequestDataKey       fwkplugin.DataKey
+	// pluginState carries each request's TTFT estimates from Filter to the
+	// first response chunk. Nil leaves the estimate metrics unrecorded.
+	pluginState *fwkplugin.PluginState
 }
 
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -163,10 +184,16 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if err := config.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
+	var pluginState *fwkplugin.PluginState
 	if handle != nil {
 		if err := registerMetrics(handle.Metrics()); err != nil {
 			return nil, err
 		}
+		ctx := handle.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		pluginState = fwkplugin.NewPluginState(ctx)
 	}
 	return &Plugin{
 		typedName:                    fwkplugin.TypedName{Type: PluginType, Name: name},
@@ -175,6 +202,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		latencyPredictionInfoDataKey: attrlatency.LatencyPredictionInfoDataKey.WithNonEmptyProducerName(config.LatencyPredictionInfoProducerName),
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
 		uncachedRequestDataKey:       attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
+		pluginState:                  pluginState,
 	}, nil
 }
 
@@ -206,9 +234,6 @@ func (c *Config) validate() error {
 	}
 	if c.QueueWaitKVCacheThreshold < 0 || c.QueueWaitKVCacheThreshold > 1.0 {
 		return fmt.Errorf("queueWaitKVCacheThreshold must be in [0, 1], got %f", c.QueueWaitKVCacheThreshold)
-	}
-	if c.FreeEndpointMaxWaiting < 0 {
-		return fmt.Errorf("freeEndpointMaxWaiting must be >= 0, got %d", c.FreeEndpointMaxWaiting)
 	}
 	if !c.usesLatencyPredictor() && c.MaxTTFTPenaltyMs > 0 && c.PeakPrefillThroughput == 0 {
 		return errors.New("peakPrefillThroughput must be > 0 when ttftSource is prefillThroughput")
@@ -252,6 +277,8 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 		}
 	}
 
+	p.saveTTFTEstimates(request, endpoints)
+
 	if len(endpoints) <= 1 || p.config.AffinityThreshold <= 0 {
 		recordDecision(p.typedName.Name, outcomeNotApplicable)
 		span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeNotApplicable))
@@ -290,9 +317,8 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 
 	// TTFT load gate: break stickiness if sticky endpoints are too slow.
 	if p.config.MaxTTFTPenaltyMs > 0 && len(nonSticky) > 0 {
-		withQueueWait := hasFreeEndpoint(endpoints, p.config.FreeEndpointMaxWaiting)
-		bestStickyTTFT, stickyOk := p.bestTTFT(sticky, withQueueWait)
-		bestNonStickyTTFT, nonStickyOk := p.bestTTFT(nonSticky, withQueueWait)
+		bestStickyTTFT, stickyOk := p.bestTTFT(sticky)
+		bestNonStickyTTFT, nonStickyOk := p.bestTTFT(nonSticky)
 		if !stickyOk || !nonStickyOk {
 			logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: TTFT load gate skipped, missing signal",
 				"stickyObserved", stickyOk, "nonStickyObserved", nonStickyOk)
@@ -350,11 +376,11 @@ func (p *Plugin) prefixCacheScore(ep fwksched.Endpoint) float64 {
 }
 
 // bestTTFT returns the lowest per-endpoint TTFT (ms) across endpoints.
-func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint, withQueueWait bool) (float64, bool) {
+func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint) (float64, bool) {
 	best := math.MaxFloat64
 	found := false
 	for _, ep := range endpoints {
-		if ttft, ok := p.endpointTTFT(ep, withQueueWait); ok && ttft < best {
+		if ttft, ok := p.endpointTTFT(ep); ok && ttft < best {
 			best = ttft
 			found = true
 		}
@@ -366,8 +392,7 @@ func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint, withQueueWait bool) (fl
 // latency predictor or estimated from in-flight tokens and peak prefill
 // throughput. Endpoints missing the required attribute contribute no signal:
 // the function returns false and the endpoint is excluded from the bestTTFT calculation.
-// withQueueWait allows the queue wait term of the full estimate.
-func (p *Plugin) endpointTTFT(ep fwksched.Endpoint, withQueueWait bool) (float64, bool) {
+func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
 	if p.config.usesLatencyPredictor() {
 		if raw, ok := ep.Get(p.latencyPredictionInfoDataKey); ok {
 			info := raw.(*attrlatency.LatencyPredictionInfo)
@@ -379,52 +404,88 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint, withQueueWait bool) (float64
 	if !ok {
 		return 0, false
 	}
-	tokens := load.Tokens
-	if p.config.usesFullEstimate() {
-		uncachedTokens, ok := p.uncachedRequestTokens(ep)
-		if !ok {
-			return 0, false
-		}
-		tokens += uncachedTokens
+	if !p.config.usesFullEstimate() {
+		return float64(load.Tokens) / p.config.PeakPrefillThroughput * 1000, true
 	}
-	ttft := float64(tokens) / p.config.PeakPrefillThroughput * 1000
-	if p.config.usesFullEstimate() && withQueueWait {
-		ttft += p.queueWaitMs(ep, load)
+	uncachedTokens, ok := p.uncachedRequestTokens(ep)
+	if !ok {
+		return 0, false
+	}
+	queued := p.queuedRequests(ep, load)
+	tokens := float64(load.Tokens)
+	if queued > 0 && load.PendingRequests > 0 {
+		// The queued requests' prefill comes after their wait, which the queue
+		// term already covers. Their tokens are taken as the average pending share.
+		tokens *= float64(max(load.PendingRequests-queued, 0)) / float64(load.PendingRequests)
+	}
+	ttft := (tokens + float64(uncachedTokens)) / p.config.PeakPrefillThroughput * 1000
+	if queued > 0 {
+		rate := max(load.CompletionsPerSecond, minCompletionsPerSecond)
+		ttft += float64(queued) / rate * 1000
 	}
 	return ttft, true
 }
 
-// queueWaitMs estimates how long a new request waits to be admitted:
-// waiting requests / completions per second. It is 0 unless the endpoint is
-// slot-bound (running within one of MaxNumSeqs) or KV-bound (KV cache usage at
-// or above QueueWaitKVCacheThreshold), because otherwise requests wait for
-// prefill token budget, which inFlightTokens already counts. A completion rate
-// of 0 is raised to one completion per producer window.
-func (p *Plugin) queueWaitMs(ep fwksched.Endpoint, load *attrconcurrency.InFlightLoad) float64 {
-	metrics := ep.GetMetrics()
-	if metrics == nil || metrics.WaitingQueueSize <= 0 {
-		return 0
+// queuedRequests returns the number of requests on the endpoint that wait to be
+// admitted: the EPP's in-flight requests beyond MaxNumSeqs, or, when KV cache
+// usage is at or above QueueWaitKVCacheThreshold, the model server's waiting
+// queue if that is larger. Requests waiting for prefill token budget are not
+// counted, since their tokens are part of the in-flight tokens.
+func (p *Plugin) queuedRequests(ep fwksched.Endpoint, load *attrconcurrency.InFlightLoad) int64 {
+	var queued int64
+	if p.config.MaxNumSeqs > 0 {
+		queued = max(load.Requests-int64(p.config.MaxNumSeqs), 0)
 	}
-	slotBound := p.config.MaxNumSeqs > 0 && metrics.RunningRequestsSize >= p.config.MaxNumSeqs-1
-	kvBound := p.config.QueueWaitKVCacheThreshold > 0 && metrics.KVCacheUsagePercent >= p.config.QueueWaitKVCacheThreshold
-	if !slotBound && !kvBound {
-		return 0
-	}
-	rate := max(load.CompletionsPerSecond, minCompletionsPerSecond)
-	return float64(metrics.WaitingQueueSize) / rate * 1000
-}
-
-// hasFreeEndpoint reports whether any endpoint has at most maxWaiting waiting
-// requests. When every endpoint is queued, moving a request off its sticky
-// endpoint does not shorten its wait and adds the prefill of its lost cache, so
-// the queue wait term is left out.
-func hasFreeEndpoint(endpoints []fwksched.Endpoint, maxWaiting int) bool {
-	for _, ep := range endpoints {
-		if metrics := ep.GetMetrics(); metrics != nil && metrics.WaitingQueueSize <= maxWaiting {
-			return true
+	if p.config.QueueWaitKVCacheThreshold > 0 {
+		if metrics := ep.GetMetrics(); metrics != nil && metrics.KVCacheUsagePercent >= p.config.QueueWaitKVCacheThreshold {
+			queued = max(queued, int64(metrics.WaitingQueueSize))
 		}
 	}
-	return false
+	return queued
+}
+
+// saveTTFTEstimates stores the throughput-based TTFT estimate of every candidate
+// endpoint for the request, so that ResponseBody can record the served
+// endpoint's estimate next to the measured TTFT.
+func (p *Plugin) saveTTFTEstimates(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) {
+	if p.pluginState == nil || request == nil || request.RequestID == "" || p.config.usesLatencyPredictor() ||
+		p.config.PeakPrefillThroughput <= 0 {
+		return
+	}
+	byEndpoint := make(map[string]time.Duration, len(endpoints))
+	for _, ep := range endpoints {
+		if ep == nil || ep.GetMetadata() == nil {
+			continue
+		}
+		if ttft, ok := p.endpointTTFT(ep); ok {
+			byEndpoint[ep.GetMetadata().ID.String()] = time.Duration(ttft * float64(time.Millisecond))
+		}
+	}
+	if len(byEndpoint) > 0 {
+		p.pluginState.Write(request.RequestID, ttftEstimateStateKey, &ttftEstimates{byEndpoint: byEndpoint, at: time.Now()})
+	}
+}
+
+// ResponseBody records, at the first response chunk, the TTFT the filter
+// estimated for the endpoint that served the request and the TTFT measured
+// since the filter ran. A request whose serving endpoint has no estimate, such
+// as a decode endpoint when the filter ran in the prefill profile, is not recorded.
+func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *requestcontrol.Response, target *fwkdl.EndpointMetadata) {
+	if p.pluginState == nil || request == nil || request.RequestID == "" || response == nil {
+		return
+	}
+	if response.StartOfStream {
+		if state, err := fwkplugin.ReadPluginStateKey[*ttftEstimates](p.pluginState, request.RequestID, ttftEstimateStateKey); err == nil && target != nil {
+			if estimated, ok := state.byEndpoint[target.ID.String()]; ok {
+				recordTTFT(p.typedName.Name, estimated, time.Since(state.at))
+			}
+		}
+		p.pluginState.Delete(request.RequestID)
+		return
+	}
+	if response.EndOfStream {
+		p.pluginState.Delete(request.RequestID)
+	}
 }
 
 // inFlightLoad returns an endpoint's in-flight load. If the attribute is absent,
