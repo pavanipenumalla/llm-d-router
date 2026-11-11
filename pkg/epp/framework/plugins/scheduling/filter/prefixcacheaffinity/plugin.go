@@ -64,8 +64,16 @@ const ttftEstimateStateKey = fwkplugin.StateKey("ttft-estimates")
 // ttftEstimates holds the TTFT estimated for each candidate endpoint when the
 // filter ran, keyed by endpoint ID, and the time it ran.
 type ttftEstimates struct {
-	byEndpoint map[string]time.Duration
+	byEndpoint map[string]ttftEstimate
 	at         time.Time
+}
+
+// ttftEstimate is an endpoint's estimated TTFT, and its prefill and
+// uncorrected queue wait parts.
+type ttftEstimate struct {
+	total     time.Duration
+	prefill   time.Duration
+	queueWait time.Duration
 }
 
 func (e *ttftEstimates) Clone() fwkplugin.StateData {
@@ -145,6 +153,12 @@ type Config struct {
 	// value > 0 adds their wait to the estimate; 0 leaves it out. Default: 0.95.
 	QueueWaitKVCacheThreshold float64 `json:"queueWaitKVCacheThreshold,omitempty"`
 
+	// QueueWaitCorrection, with TTFTEstimateFull, scales the queue wait by the
+	// ratio of measured to estimated queue wait of the requests that received
+	// their first token in the last 30 s, across all endpoints, bounded to
+	// [0.25, 1]. Default: false.
+	QueueWaitCorrection bool `json:"queueWaitCorrection,omitempty"`
+
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
 	InFlightLoadProducerName          string `json:"inFlightLoadProducerName,omitempty"`
@@ -172,6 +186,8 @@ type Plugin struct {
 	// pluginState carries each request's TTFT estimates from Filter to the
 	// first response chunk. Nil leaves the estimate metrics unrecorded.
 	pluginState *fwkplugin.PluginState
+	// queueWait is nil unless QueueWaitCorrection is set and pluginState exists.
+	queueWait *queueWaitCorrection
 }
 
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -195,6 +211,10 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		}
 		pluginState = fwkplugin.NewPluginState(ctx)
 	}
+	var queueWait *queueWaitCorrection
+	if config.QueueWaitCorrection && pluginState != nil {
+		queueWait = &queueWaitCorrection{}
+	}
 	return &Plugin{
 		typedName:                    fwkplugin.TypedName{Type: PluginType, Name: name},
 		config:                       config,
@@ -203,6 +223,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
 		uncachedRequestDataKey:       attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
 		pluginState:                  pluginState,
+		queueWait:                    queueWait,
 	}, nil
 }
 
@@ -393,23 +414,38 @@ func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint) (float64, bool) {
 // throughput. Endpoints missing the required attribute contribute no signal:
 // the function returns false and the endpoint is excluded from the bestTTFT calculation.
 func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
+	prefill, queueWait, ok := p.endpointTTFTParts(ep)
+	return prefill + queueWait*p.queueWaitFactor(queueWait), ok
+}
+
+// queueWaitFactor returns the queue wait correction factor, or 1 without one.
+func (p *Plugin) queueWaitFactor(queueWait float64) float64 {
+	if queueWait <= 0 || p.queueWait == nil {
+		return 1
+	}
+	return p.queueWait.factor(time.Now())
+}
+
+// endpointTTFTParts returns the prefill and uncorrected queue wait parts (ms)
+// of endpointTTFT.
+func (p *Plugin) endpointTTFTParts(ep fwksched.Endpoint) (float64, float64, bool) {
 	if p.config.usesLatencyPredictor() {
 		if raw, ok := ep.Get(p.latencyPredictionInfoDataKey); ok {
 			info := raw.(*attrlatency.LatencyPredictionInfo)
-			return info.TTFT(), true
+			return info.TTFT(), 0, true
 		}
-		return math.MaxFloat64, false
+		return math.MaxFloat64, 0, false
 	}
 	load, ok := p.inFlightLoad(ep)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	if !p.config.usesFullEstimate() {
-		return float64(load.Tokens) / p.config.PeakPrefillThroughput * 1000, true
+		return float64(load.Tokens) / p.config.PeakPrefillThroughput * 1000, 0, true
 	}
 	uncachedTokens, ok := p.uncachedRequestTokens(ep)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	queued := p.queuedRequests(ep, load)
 	tokens := float64(load.Tokens)
@@ -419,11 +455,12 @@ func (p *Plugin) endpointTTFT(ep fwksched.Endpoint) (float64, bool) {
 		tokens *= float64(max(load.PendingRequests-queued, 0)) / float64(load.PendingRequests)
 	}
 	ttft := (tokens + float64(uncachedTokens)) / p.config.PeakPrefillThroughput * 1000
+	var queueWait float64
 	if queued > 0 {
 		rate := max(load.CompletionsPerSecond, minCompletionsPerSecond)
-		ttft += float64(queued) / rate * 1000
+		queueWait = float64(queued) / rate * 1000
 	}
-	return ttft, true
+	return ttft, queueWait, true
 }
 
 // queuedRequests returns the number of requests on the endpoint that wait to be
@@ -452,13 +489,19 @@ func (p *Plugin) saveTTFTEstimates(request *fwksched.InferenceRequest, endpoints
 		p.config.PeakPrefillThroughput <= 0 {
 		return
 	}
-	byEndpoint := make(map[string]time.Duration, len(endpoints))
+	byEndpoint := make(map[string]ttftEstimate, len(endpoints))
 	for _, ep := range endpoints {
 		if ep == nil || ep.GetMetadata() == nil {
 			continue
 		}
-		if ttft, ok := p.endpointTTFT(ep); ok {
-			byEndpoint[ep.GetMetadata().ID.String()] = time.Duration(ttft * float64(time.Millisecond))
+		prefill, queueWait, ok := p.endpointTTFTParts(ep)
+		if !ok {
+			continue
+		}
+		byEndpoint[ep.GetMetadata().ID.String()] = ttftEstimate{
+			total:     time.Duration((prefill + queueWait*p.queueWaitFactor(queueWait)) * float64(time.Millisecond)),
+			prefill:   time.Duration(prefill * float64(time.Millisecond)),
+			queueWait: time.Duration(queueWait * float64(time.Millisecond)),
 		}
 	}
 	if len(byEndpoint) > 0 {
@@ -468,8 +511,9 @@ func (p *Plugin) saveTTFTEstimates(request *fwksched.InferenceRequest, endpoints
 
 // ResponseBody records, at the first response chunk, the TTFT the filter
 // estimated for the endpoint that served the request and the TTFT measured
-// since the filter ran. A request whose serving endpoint has no estimate, such
-// as a decode endpoint when the filter ran in the prefill profile, is not recorded.
+// since the filter ran, and feeds the queue wait correction. A request whose
+// serving endpoint has no estimate, such as a decode endpoint when the filter
+// ran in the prefill profile, is not recorded.
 func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *requestcontrol.Response, target *fwkdl.EndpointMetadata) {
 	if p.pluginState == nil || request == nil || request.RequestID == "" || response == nil {
 		return
@@ -477,7 +521,13 @@ func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequ
 	if response.StartOfStream {
 		if state, err := fwkplugin.ReadPluginStateKey[*ttftEstimates](p.pluginState, request.RequestID, ttftEstimateStateKey); err == nil && target != nil {
 			if estimated, ok := state.byEndpoint[target.ID.String()]; ok {
-				recordTTFT(p.typedName.Name, estimated, time.Since(state.at))
+				now := time.Now()
+				measured := now.Sub(state.at)
+				recordTTFT(p.typedName.Name, estimated.total, measured)
+				if p.queueWait != nil {
+					// The measured time beyond the estimated prefill time is taken as the queue wait.
+					p.queueWait.add(now, measured-estimated.prefill, estimated.queueWait)
+				}
 			}
 		}
 		p.pluginState.Delete(request.RequestID)
