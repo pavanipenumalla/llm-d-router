@@ -19,6 +19,7 @@ package prefixcacheaffinity
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -130,7 +131,7 @@ func TestResponseBodyRecordsTTFTEstimate(t *testing.T) {
 	p.pluginState = fwkplugin.NewPluginState(t.Context())
 	endpoints := []fwksched.Endpoint{makeEndpoint("a", 90, -1, 1500, 500), makeEndpoint("b", 10, -1, 0, 0)}
 
-	request := &fwksched.InferenceRequest{RequestID: "served-a"}
+	request := &fwksched.InferenceRequest{RequestID: "served-a", TargetModel: testTargetModel}
 	p.Filter(context.Background(), request, endpoints)
 	served := endpoints[0].GetMetadata()
 	p.ResponseBody(context.Background(), request, &requestcontrol.Response{StartOfStream: true}, served)
@@ -141,7 +142,7 @@ func TestResponseBodyRecordsTTFTEstimate(t *testing.T) {
 	_, err := p.pluginState.Read(request.RequestID, ttftEstimateStateKey)
 	assert.ErrorIs(t, err, fwkplugin.ErrNotFound, "the estimates are released at the first chunk")
 
-	other := &fwksched.InferenceRequest{RequestID: "served-elsewhere"}
+	other := &fwksched.InferenceRequest{RequestID: "served-elsewhere", TargetModel: testTargetModel}
 	p.Filter(context.Background(), other, endpoints)
 	unknown := &fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "c", Namespace: "default"}}
 	p.ResponseBody(context.Background(), other, &requestcontrol.Response{StartOfStream: true}, unknown)
@@ -149,22 +150,51 @@ func TestResponseBodyRecordsTTFTEstimate(t *testing.T) {
 
 	predictor := newTestPlugin(Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourceLatencyPredictor})
 	predictor.pluginState = fwkplugin.NewPluginState(t.Context())
-	predicted := &fwksched.InferenceRequest{RequestID: "predictor"}
+	predicted := &fwksched.InferenceRequest{RequestID: "predictor", TargetModel: testTargetModel}
 	predictor.Filter(context.Background(), predicted, []fwksched.Endpoint{makeEndpoint("a", 90, 100, 0, -1), makeEndpoint("b", 10, 50, 0, -1)})
 	predictor.ResponseBody(context.Background(), predicted, &requestcontrol.Response{StartOfStream: true}, served)
 	assert.Equal(t, uint64(1), histogramCount(t, estimatedTTFT), "the latency predictor source records nothing")
 }
 
+// A request still waiting for its first chunk after the PluginState staleness
+// threshold keeps its estimate while its request ctx is alive.
+func TestResponseBodyRecordsTTFTEstimateAfterStaleness(t *testing.T) {
+	resetMetrics()
+	t.Cleanup(resetMetrics)
+
+	p := newTestPlugin(Config{AffinityThreshold: 0.80, MaxTTFTPenaltyMs: 2000, TTFTSource: TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000, TTFTEstimate: TTFTEstimateFull})
+	p.pluginState = fwkplugin.NewPluginState(t.Context(),
+		fwkplugin.WithStalenessThreshold(20*time.Millisecond), fwkplugin.WithCleanupInterval(5*time.Millisecond))
+	endpoints := []fwksched.Endpoint{makeEndpoint("a", 90, -1, 1500, 500), makeEndpoint("b", 10, -1, 0, 0)}
+	served := endpoints[0].GetMetadata()
+
+	live := &fwksched.InferenceRequest{RequestID: "slow-live", TargetModel: testTargetModel}
+	p.Filter(t.Context(), live, endpoints)
+	ended, cancel := context.WithCancel(t.Context())
+	gone := &fwksched.InferenceRequest{RequestID: "slow-ended", TargetModel: testTargetModel}
+	p.Filter(ended, gone, endpoints)
+	cancel()
+
+	time.Sleep(100 * time.Millisecond)
+	p.ResponseBody(context.Background(), live, &requestcontrol.Response{StartOfStream: true}, served)
+	p.ResponseBody(context.Background(), gone, &requestcontrol.Response{StartOfStream: true}, served)
+	assert.Equal(t, uint64(1), histogramCount(t, estimatedTTFT), "only the request with a live ctx keeps its estimate")
+	assert.Equal(t, uint64(1), histogramCount(t, actualTTFT))
+}
+
+const testTargetModel = "model-a"
+
 func histogramCount(t *testing.T, h *prometheus.HistogramVec) uint64 {
 	t.Helper()
 	m := &dto.Metric{}
-	require.NoError(t, h.WithLabelValues("test").(prometheus.Histogram).Write(m))
+	require.NoError(t, h.WithLabelValues("test", PluginType, testTargetModel).(prometheus.Histogram).Write(m))
 	return m.GetHistogram().GetSampleCount()
 }
 
 func histogramSum(t *testing.T, h *prometheus.HistogramVec) float64 {
 	t.Helper()
 	m := &dto.Metric{}
-	require.NoError(t, h.WithLabelValues("test").(prometheus.Histogram).Write(m))
+	require.NoError(t, h.WithLabelValues("test", PluginType, testTargetModel).(prometheus.Histogram).Write(m))
 	return m.GetHistogram().GetSampleSum()
 }

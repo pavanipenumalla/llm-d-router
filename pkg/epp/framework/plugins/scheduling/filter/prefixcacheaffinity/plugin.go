@@ -62,14 +62,15 @@ var (
 const ttftEstimateStateKey = fwkplugin.StateKey("ttft-estimates")
 
 // ttftEstimates holds the TTFT estimated for each candidate endpoint when the
-// filter ran, keyed by endpoint ID, and the time it ran.
+// filter ran, keyed by endpoint ID, the time it ran and the request's target model.
 type ttftEstimates struct {
-	byEndpoint map[string]time.Duration
-	at         time.Time
+	byEndpoint  map[string]time.Duration
+	at          time.Time
+	targetModel string
 }
 
 func (e *ttftEstimates) Clone() fwkplugin.StateData {
-	return &ttftEstimates{byEndpoint: maps.Clone(e.byEndpoint), at: e.at}
+	return &ttftEstimates{byEndpoint: maps.Clone(e.byEndpoint), at: e.at, targetModel: e.targetModel}
 }
 
 // TTFTSource selects the per-endpoint TTFT signal used by the load gate. The
@@ -277,7 +278,7 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 		}
 	}
 
-	p.saveTTFTEstimates(request, endpoints)
+	p.saveTTFTEstimates(ctx, request, endpoints)
 
 	if len(endpoints) <= 1 || p.config.AffinityThreshold <= 0 {
 		recordDecision(p.typedName.Name, outcomeNotApplicable)
@@ -446,8 +447,10 @@ func (p *Plugin) queuedRequests(ep fwksched.Endpoint, load *attrconcurrency.InFl
 
 // saveTTFTEstimates stores the throughput-based TTFT estimate of every candidate
 // endpoint for the request, so that ResponseBody can record the served
-// endpoint's estimate next to the measured TTFT.
-func (p *Plugin) saveTTFTEstimates(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) {
+// endpoint's estimate next to the measured TTFT. The estimates are kept while
+// ctx is alive, so a request still waiting for its first chunk after the
+// PluginState staleness threshold is recorded too.
+func (p *Plugin) saveTTFTEstimates(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) {
 	if p.pluginState == nil || request == nil || request.RequestID == "" || p.config.usesLatencyPredictor() ||
 		p.config.PeakPrefillThroughput <= 0 {
 		return
@@ -462,7 +465,9 @@ func (p *Plugin) saveTTFTEstimates(request *fwksched.InferenceRequest, endpoints
 		}
 	}
 	if len(byEndpoint) > 0 {
-		p.pluginState.Write(request.RequestID, ttftEstimateStateKey, &ttftEstimates{byEndpoint: byEndpoint, at: time.Now()})
+		p.pluginState.Write(request.RequestID, ttftEstimateStateKey,
+			&ttftEstimates{byEndpoint: byEndpoint, at: time.Now(), targetModel: request.TargetModel})
+		p.pluginState.BindLiveness(ctx, request.RequestID)
 	}
 }
 
@@ -477,7 +482,7 @@ func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequ
 	if response.StartOfStream {
 		if state, err := fwkplugin.ReadPluginStateKey[*ttftEstimates](p.pluginState, request.RequestID, ttftEstimateStateKey); err == nil && target != nil {
 			if estimated, ok := state.byEndpoint[target.ID.String()]; ok {
-				recordTTFT(p.typedName.Name, estimated, time.Since(state.at))
+				recordTTFT(p.typedName, state.targetModel, estimated, time.Since(state.at))
 			}
 		}
 		p.pluginState.Delete(request.RequestID)

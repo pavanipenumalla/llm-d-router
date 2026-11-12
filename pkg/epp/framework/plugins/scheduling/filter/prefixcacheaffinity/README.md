@@ -147,7 +147,8 @@ to `latencyPredictor` to source TTFT from the latency predictor instead.
 - `llm_d_epp_prefix_cache_affinity_filter_decisions_total` (`plugin_name`, `outcome`): one
   count per filter run, by decision outcome.
 - `llm_d_epp_prefix_cache_affinity_filter_estimated_ttft_seconds` and
-  `llm_d_epp_prefix_cache_affinity_filter_actual_ttft_seconds` (`plugin_name`): with
+  `llm_d_epp_prefix_cache_affinity_filter_actual_ttft_seconds` (`plugin_name`, `plugin_type`,
+  `target_model_name`): with
   `ttftSource: prefillThroughput`, at a request's first response chunk, the TTFT the filter
   estimated for the endpoint that served it and the time from the filter's run to that chunk.
   Requests served by an endpoint the filter did not see, such as a decode endpoint when the

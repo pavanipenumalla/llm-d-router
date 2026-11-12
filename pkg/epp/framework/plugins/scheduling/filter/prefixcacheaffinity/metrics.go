@@ -25,6 +25,7 @@ import (
 	compbasemetrics "k8s.io/component-base/metrics"
 
 	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	eppmetrics "github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
@@ -65,6 +66,10 @@ var ttftBuckets = []float64{
 	60, 90, 120, 180, 300, 600,
 }
 
+// ttftLabels are the labels of the estimated and actual TTFT histograms, as on
+// the predicted-latency producer's TTFT histograms.
+var ttftLabels = []string{"plugin_name", "plugin_type", "target_model_name"}
+
 var estimatedTTFT = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
@@ -72,7 +77,7 @@ var estimatedTTFT = prometheus.NewHistogramVec(
 		Help:      metricsutil.HelpMsgWithStability("TTFT the filter estimated for the endpoint that served the request, in seconds.", compbasemetrics.ALPHA),
 		Buckets:   ttftBuckets,
 	},
-	[]string{"plugin_name"},
+	ttftLabels,
 )
 
 var actualTTFT = prometheus.NewHistogramVec(
@@ -82,7 +87,7 @@ var actualTTFT = prometheus.NewHistogramVec(
 		Help:      metricsutil.HelpMsgWithStability("TTFT measured from the filter's decision to the first response chunk, for requests with an estimate, in seconds.", compbasemetrics.ALPHA),
 		Buckets:   ttftBuckets,
 	},
-	[]string{"plugin_name"},
+	ttftLabels,
 )
 
 // registerMetrics registers the filter collectors on the given registerer. A nil
@@ -109,9 +114,9 @@ func recordDecision(pluginName, outcome string) {
 }
 
 // recordTTFT records a request's estimated and actual TTFT.
-func recordTTFT(pluginName string, estimated, actual time.Duration) {
-	estimatedTTFT.WithLabelValues(pluginName).Observe(estimated.Seconds())
-	actualTTFT.WithLabelValues(pluginName).Observe(actual.Seconds())
+func recordTTFT(plugin fwkplugin.TypedName, targetModel string, estimated, actual time.Duration) {
+	estimatedTTFT.WithLabelValues(plugin.Name, plugin.Type, targetModel).Observe(estimated.Seconds())
+	actualTTFT.WithLabelValues(plugin.Name, plugin.Type, targetModel).Observe(actual.Seconds())
 }
 
 // resetMetrics clears the collectors between tests.
